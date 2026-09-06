@@ -282,6 +282,8 @@ class DockerConversationRegistry:
             "-d",
             "--platform",
             platform,
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
             "--rm",
             "--ulimit",
             "nofile=65536:65536",

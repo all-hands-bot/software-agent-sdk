@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import threading
 from uuid import UUID, uuid4
 
@@ -134,6 +136,38 @@ async def test_failed_start_can_be_retried(tmp_path):
     assert calls == 2
     assert container.container_id == f"container-{conversation_id}"
     assert is_new is True
+
+
+def test_run_container_uses_host_identity_for_bind_mounts(tmp_path, monkeypatch):
+    registry = DockerConversationRegistry(Config(conversations_path=tmp_path))
+    commands: list[list[str]] = []
+
+    def execute(command, **kwargs):
+        commands.append(command)
+        stdout = "test-container\n" if command[:3] == ["docker", "run", "-d"] else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.execute_command", execute
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.find_available_tcp_port",
+        lambda: 32123,
+    )
+
+    container = registry._run_container(
+        image="test-image",
+        platform="linux/amd64",
+        volumes=["/host/path:/container/path"],
+        env={},
+        network=None,
+        api_key=None,
+    )
+
+    run_command = commands[1]
+    user_flag = run_command.index("--user")
+    assert run_command[user_flag + 1] == f"{os.getuid()}:{os.getgid()}"
+    assert container.container_id == "test-container"
 
 
 def test_container_env_forces_inner_runtime_to_local(tmp_path, monkeypatch):
