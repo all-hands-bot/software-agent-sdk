@@ -1,5 +1,6 @@
 """Tests for repository cloning and skill loading in OpenHandsCloudWorkspace."""
 
+import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -125,6 +126,18 @@ class TestRepoSource:
         repo = RepoSource(url="my-org/my-repo", provider="github")
         assert repo.url == "my-org/my-repo"
 
+    def test_http_url_credentials_redacted_in_warning(self, caplog):
+        """The http->https normalization warning must not leak embedded creds."""
+        with caplog.at_level(logging.WARNING):
+            repo = RepoSource(url="http://oauth2:SUPERSECRET@github.com/owner/repo.git")
+        # The credential never reaches the logs...
+        assert "SUPERSECRET" not in caplog.text
+        assert "oauth2" not in caplog.text
+        assert "Converting HTTP URL to HTTPS" in caplog.text
+        assert "http://****@github.com/owner/repo.git" in caplog.text
+        # ...but normalization still happens on the stored value.
+        assert repo.url == "https://oauth2:SUPERSECRET@github.com/owner/repo.git"
+
 
 class TestProviderDetection:
     """Tests for provider detection from URLs."""
@@ -247,6 +260,57 @@ class TestHelperFunctions:
         )
         assert url == "https://github.com/owner/repo"
 
+    def test_build_clone_url_self_hosted_gitlab_with_explicit_provider(self):
+        """A self-hosted GitLab host gets the token when provider is explicit."""
+        url = _build_clone_url(
+            "https://gitlab.mycompany.com/owner/repo",
+            GitProvider.GITLAB,
+            "gltoken123",
+            explicit_provider=True,
+        )
+        assert url == "https://oauth2:gltoken123@gitlab.mycompany.com/owner/repo"
+
+    def test_build_clone_url_self_hosted_host_without_explicit_provider(self):
+        """An auto-detected provider must not inject a token into an unrelated host."""
+        url = _build_clone_url(
+            "https://gitlab.mycompany.com/owner/repo",
+            GitProvider.GITLAB,
+            "gltoken123",
+            explicit_provider=False,
+        )
+        assert url == "https://gitlab.mycompany.com/owner/repo"
+
+    @pytest.mark.parametrize("explicit_provider", [False, True])
+    def test_build_clone_url_lookalike_host_not_injected(self, explicit_provider):
+        """A lookalike of the public host never receives the token."""
+        url = _build_clone_url(
+            "https://github.com.evil.com/owner/repo",
+            GitProvider.GITHUB,
+            "ghtoken123",
+            explicit_provider=explicit_provider,
+        )
+        assert url == "https://github.com.evil.com/owner/repo"
+
+    def test_build_clone_url_self_hosted_host_is_normalized(self):
+        """Host case and non-default port survive token injection."""
+        url = _build_clone_url(
+            "https://GitLab.MyCompany.com:8443/owner/repo",
+            GitProvider.GITLAB,
+            "gltoken123",
+            explicit_provider=True,
+        )
+        assert url == "https://oauth2:gltoken123@gitlab.mycompany.com:8443/owner/repo"
+
+    def test_build_clone_url_existing_credentials_preserved(self):
+        """A URL that already carries credentials keeps its own."""
+        url = _build_clone_url(
+            "https://oauth2:embedded@gitlab.mycompany.com/owner/repo",
+            GitProvider.GITLAB,
+            "gltoken123",
+            explicit_provider=True,
+        )
+        assert url == "https://oauth2:embedded@gitlab.mycompany.com/owner/repo"
+
 
 class TestGetReposContext:
     """Tests for get_repos_context function."""
@@ -368,6 +432,30 @@ class TestCloneRepos:
             assert result.repo_mappings == {}
 
     @patch("subprocess.run")
+    def test_clone_failure_redacts_credentials_in_stderr(self, mock_run, caplog):
+        """A failing clone must not leak the auth token echoed back in stderr."""
+        token = "ghp_supersecrettoken"
+        # git often echoes the authenticated remote URL back in stderr on failure.
+        leaky_stderr = (
+            f"fatal: Authentication failed for "
+            f"'https://{token}@github.com/owner/repo.git/'"
+        )
+        mock_run.return_value = MagicMock(returncode=1, stderr=leaky_stderr)
+
+        def token_fetcher(name: str) -> str | None:
+            return token if name == "github_token" else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [RepoSource(url="owner/repo", provider="github")]
+            with caplog.at_level(logging.WARNING):
+                result = clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+        assert result.success_count == 0
+        assert token not in caplog.text
+        assert "[clone] Failed:" in caplog.text
+        assert "https://****@github.com/owner/repo.git" in caplog.text
+
+    @patch("subprocess.run")
     def test_clone_with_token_fetcher(self, mock_run):
         """Test clone with token fetcher callback."""
         mock_run.return_value = MagicMock(returncode=0, stderr="")
@@ -410,6 +498,30 @@ class TestCloneRepos:
             # Should have fetched github_token and gitlab_token
             assert "github_token" in fetched_tokens
             assert "gitlab_token" in fetched_tokens
+
+    @patch("subprocess.run")
+    def test_clone_self_hosted_gitlab_with_token(self, mock_run):
+        """A self-hosted GitLab instance clones with the token authenticated,
+        instead of silently sending an unauthenticated request."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        def token_fetcher(name: str) -> str | None:
+            return "gltoken123" if name == "gitlab_token" else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = [
+                RepoSource(
+                    url="https://gitlab.mycompany.com/owner/repo",
+                    provider="gitlab",
+                )
+            ]
+            clone_repos(repos, Path(tmpdir), token_fetcher=token_fetcher)
+
+            call_args = mock_run.call_args[0][0]
+            assert any(
+                "oauth2:gltoken123@gitlab.mycompany.com" in str(arg)
+                for arg in call_args
+            )
 
     @patch("subprocess.run")
     def test_directory_name_collision(self, mock_run):

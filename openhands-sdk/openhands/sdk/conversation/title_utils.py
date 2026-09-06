@@ -1,6 +1,6 @@
 """Utility functions for generating conversation titles."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.event.base import Event
@@ -59,13 +59,21 @@ def extract_first_user_message(events: Sequence[Event]) -> str | None:
     return None
 
 
-def generate_title_with_llm(message: str, llm: LLM, max_length: int = 50) -> str | None:
+def generate_title_with_llm(
+    message: str,
+    llm: LLM,
+    max_length: int = 50,
+    on_error: Callable[[Exception], None] | None = None,
+) -> str | None:
     """Generate a conversation title using LLM.
 
     Args:
         message: The first user message to generate title from.
         llm: The LLM to use for title generation.
         max_length: Maximum length of the generated title.
+        on_error: Optional callback invoked with the exception when the LLM
+            call fails. Title generation still falls back (returns None); the
+            callback lets callers surface the otherwise-swallowed error.
 
     Returns:
         Generated title, or None if LLM fails or returns empty response.
@@ -118,7 +126,11 @@ def generate_title_with_llm(message: str, llm: LLM, max_length: int = 50) -> str
             ),
         ]
 
-        # Get completion from LLM
+        # Force non-streaming: the title is consumed whole with no on_token
+        # callback, which a streaming LLM requires.
+        if llm.stream:
+            llm = llm.model_copy(update={"stream": False})
+
         response = llm.completion(messages)
 
         # Extract the title from the response
@@ -138,6 +150,10 @@ def generate_title_with_llm(message: str, llm: LLM, max_length: int = 50) -> str
 
     except Exception as e:
         logger.warning(f"Error generating conversation title with LLM: {e}")
+        # Non-fatal (we fall back to truncation), but let callers surface the
+        # otherwise-invisible LLM error to the UI (issue #16686).
+        if on_error is not None:
+            on_error(e)
         return None
 
 
@@ -158,7 +174,10 @@ def generate_fallback_title(message: str, max_length: int = 50) -> str:
 
 
 def generate_title_from_message(
-    message: str, llm: LLM | None = None, max_length: int = 50
+    message: str,
+    llm: LLM | None = None,
+    max_length: int = 50,
+    on_error: Callable[[Exception], None] | None = None,
 ) -> str:
     """Generate a title from an already-extracted user message."""
     # Skip the ACP sentinel LLM — it has no credentials and cannot be
@@ -167,7 +186,9 @@ def generate_title_from_message(
     llm_to_use = None if llm and llm.usage_id == "acp-managed" else llm
 
     if llm_to_use:
-        llm_title = generate_title_with_llm(message, llm_to_use, max_length)
+        llm_title = generate_title_with_llm(
+            message, llm_to_use, max_length, on_error=on_error
+        )
         if llm_title:
             return llm_title
 
@@ -175,7 +196,10 @@ def generate_title_from_message(
 
 
 def generate_conversation_title(
-    events: Sequence[Event], llm: LLM | None = None, max_length: int = 50
+    events: Sequence[Event],
+    llm: LLM | None = None,
+    max_length: int = 50,
+    on_error: Callable[[Exception], None] | None = None,
 ) -> str:
     """Generate a title for a conversation based on the first user message.
 
@@ -201,91 +225,6 @@ def generate_conversation_title(
     if not first_user_message:
         raise ValueError("No user messages found in conversation events")
 
-    return generate_title_from_message(first_user_message, llm, max_length)
-
-
-# ---------------------------------------------------------------------------
-# Async variants
-# ---------------------------------------------------------------------------
-
-
-async def agenerate_title_with_llm(
-    message: str, llm: LLM, max_length: int = 50
-) -> str | None:
-    """Async variant of :func:`generate_title_with_llm`."""
-    if len(message) > 1000:
-        truncated_message = message[:1000] + "...(truncated)"
-    else:
-        truncated_message = message
-
-    emojis_descriptions = "\n- ".join(
-        f"{c['emoji']} {c['name']}: {c['description']}" for c in categories
+    return generate_title_from_message(
+        first_user_message, llm, max_length, on_error=on_error
     )
-
-    try:
-        messages = [
-            Message(
-                role="system",
-                content=[
-                    TextContent(
-                        text=(
-                            "You are a helpful assistant that generates concise, "
-                            "descriptive titles for conversations with OpenHands. "
-                            "OpenHands is a helpful AI agent that can interact "
-                            "with a computer to solve tasks using bash terminal, "
-                            "file editor, and browser. Given a user message "
-                            "(which may be truncated), generate a concise, "
-                            "descriptive title for the conversation. Return only "
-                            "the title, with no additional text, quotes, or "
-                            "explanations."
-                        )
-                    )
-                ],
-            ),
-            Message(
-                role="user",
-                content=[
-                    TextContent(
-                        text=(
-                            f"Generate a title (maximum {max_length} characters) "
-                            f"for a conversation that starts with this message:\n\n"
-                            f"{truncated_message}."
-                            "Also make sure to include ONE most relevant emoji at "
-                            "the start of the title."
-                            f" Choose the emoji from this list:{emojis_descriptions} "
-                        )
-                    )
-                ],
-            ),
-        ]
-
-        response = await llm.acompletion(messages)
-
-        if response.message.content and isinstance(
-            response.message.content[0], TextContent
-        ):
-            title = response.message.content[0].text.strip()
-            if len(title) > max_length:
-                title = title[: max_length - 3] + "..."
-            return title
-        else:
-            logger.warning("LLM returned empty response for title generation")
-            return None
-
-    except Exception as e:
-        logger.warning(f"Error generating conversation title with LLM: {e}")
-        return None
-
-
-async def agenerate_title_from_message(
-    message: str, llm: LLM | None = None, max_length: int = 50
-) -> str:
-    """Async variant of :func:`generate_title_from_message`."""
-    llm_to_use = None if llm and llm.usage_id == "acp-managed" else llm
-
-    if llm_to_use:
-        llm_title = await agenerate_title_with_llm(message, llm_to_use, max_length)
-        if llm_title:
-            return llm_title
-
-    return generate_fallback_title(message, max_length)

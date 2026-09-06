@@ -27,6 +27,7 @@ from openhands.sdk.agent.utils import (
     parse_tool_call_arguments,
     prepare_llm_messages,
 )
+from openhands.sdk.context.prompts.presets import PromptPreset, create_registry
 from openhands.sdk.conversation import (
     CancellationToken,
     ConversationCallbackType,
@@ -49,7 +50,10 @@ from openhands.sdk.event.condenser import (
     Condensation,
     CondensationRequest,
 )
+from openhands.sdk.event.error_classification import AGENT_OUTCOME
 from openhands.sdk.llm import (
+    LLM,
+    ImageContent,
     LLMResponse,
     Message,
     MessageToolCall,
@@ -60,13 +64,16 @@ from openhands.sdk.llm import (
 )
 from openhands.sdk.llm.exceptions import (
     FunctionCallValidationError,
+    LLMContentPolicyViolationError,
     LLMContextWindowExceedError,
     LLMMalformedConversationHistoryError,
 )
+from openhands.sdk.llm.router.base import RouterLLM
 from openhands.sdk.logger import get_logger
 from openhands.sdk.observability.laminar import (
     maybe_init_laminar,
     observe,
+    record_tool_result,
     should_enable_observability,
 )
 from openhands.sdk.observability.utils import extract_action_name
@@ -77,6 +84,7 @@ from openhands.sdk.tool import (
 
 
 if TYPE_CHECKING:
+    from openhands.sdk.llm.llm import LLMCallContext
     from openhands.sdk.tool import ToolDefinition
 from openhands.sdk.mcp.tool import MCPToolDefinition
 from openhands.sdk.tool.builtins import (
@@ -84,6 +92,7 @@ from openhands.sdk.tool.builtins import (
     FinishTool,
     ThinkAction,
 )
+from openhands.sdk.tool.builtins.vision_inspect import VISION_INSPECT_TOOL_NAME
 
 
 logger = get_logger(__name__)
@@ -109,6 +118,68 @@ def _tool_has_summary_param(tool: ToolDefinition) -> bool:
 # Maximum number of events to scan during init_state defensive checks.
 # SystemPromptEvent must appear within this prefix (at index 0 or 1).
 INIT_STATE_PREFIX_SCAN_WINDOW = 3
+
+
+def _latest_user_message_contains_image(messages: list[Message]) -> bool:
+    for message in reversed(messages):
+        if message.role == "user":
+            return message.contains_image
+    return False
+
+
+def _non_multimodal_image_message(model: str) -> Message:
+    return Message(
+        role="assistant",
+        content=[
+            TextContent(
+                text=(
+                    "I received your image, but the currently selected model "
+                    f"({model}) does not support image understanding. Please "
+                    "switch to a multimodal model to analyze the image."
+                )
+            )
+        ],
+    )
+
+
+def _replace_latest_user_images_with_references(
+    messages: list[Message],
+) -> list[Message]:
+    rewritten = list(messages)
+    for index in range(len(rewritten) - 1, -1, -1):
+        message = rewritten[index]
+        if message.role != "user" or not message.contains_image:
+            continue
+
+        image_index = 0
+        content: list[TextContent | ImageContent] = []
+        for item in message.content:
+            if isinstance(item, ImageContent):
+                for _ in item.image_urls:
+                    content.append(
+                        TextContent(
+                            text=(
+                                f"[Image {image_index} is attached to the latest "
+                                "user message. Use the inspect_image_with_vision "
+                                f"tool with image_index={image_index} to inspect it.]"
+                            )
+                        )
+                    )
+                    image_index += 1
+            else:
+                content.append(item)
+
+        rewritten[index] = message.model_copy(update={"content": content})
+        break
+    return rewritten
+
+
+def _should_handle_non_multimodal_image_input(
+    llm: LLM, messages: list[Message]
+) -> bool:
+    if isinstance(llm, RouterLLM):
+        return False
+    return _latest_user_message_contains_image(messages) and not llm.vision_is_active()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +235,7 @@ class _ActionBatch:
         tool_runner: Callable[[ActionEvent], list[Event]],
         tools: dict[str, ToolDefinition] | None = None,
         cancel_token: CancellationToken | None = None,
+        span_owner: object | None = None,
     ) -> _ActionBatch:
         """Truncate, partition blocked actions, execute the rest, return the batch."""
         action_events, has_finish = cls._truncate_at_finish(action_events)
@@ -178,7 +250,11 @@ class _ActionBatch:
                 executable.append(ae)
 
         executed_results = executor.execute_batch(
-            executable, tool_runner, tools, cancel_token
+            executable,
+            tool_runner,
+            tools,
+            cancel_token,
+            span_owner=span_owner,
         )
         results_by_id = dict(zip([ae.id for ae in executable], executed_results))
 
@@ -198,6 +274,7 @@ class _ActionBatch:
         tool_runner: Callable[[ActionEvent], list[Event]],
         tools: dict[str, ToolDefinition] | None = None,
         cancel_token: CancellationToken | None = None,
+        span_owner: object | None = None,
     ) -> _ActionBatch:
         """Async variant of :meth:`prepare`.
 
@@ -217,7 +294,11 @@ class _ActionBatch:
                 executable.append(ae)
 
         executed_results = await executor.aexecute_batch(
-            executable, tool_runner, tools, cancel_token
+            executable,
+            tool_runner,
+            tools,
+            cancel_token,
+            span_owner=span_owner,
         )
         results_by_id = dict(zip([ae.id for ae in executable], executed_results))
 
@@ -228,21 +309,31 @@ class _ActionBatch:
             results_by_id=results_by_id,
         )
 
-    def emit(self, on_event: ConversationCallbackType) -> None:
+    def emit(
+        self,
+        conversation: LocalConversation,
+        on_event: ConversationCallbackType,
+    ) -> None:
         """Emit all events in original action order."""
         for ae in self.action_events:
             reason = self.blocked_reasons.get(ae.id)
             if reason is not None:
                 logger.info(f"Action '{ae.tool_name}' blocked by hook: {reason}")
-                on_event(
-                    UserRejectObservation(
-                        action_id=ae.id,
-                        tool_name=ae.tool_name,
-                        tool_call_id=ae.tool_call_id,
-                        rejection_reason=reason,
-                        rejection_source="hook",
-                    )
+                rejection = UserRejectObservation(
+                    action_id=ae.id,
+                    tool_name=ae.tool_name,
+                    tool_call_id=ae.tool_call_id,
+                    rejection_reason=reason,
+                    rejection_source="hook",
                 )
+                record_tool_result(
+                    conversation,
+                    name=extract_action_name(ae),
+                    tool_call_id=ae.tool_call_id,
+                    tool_input=ae.action,
+                    tool_output=rejection.to_llm_message(),
+                )
+                on_event(rejection)
             else:
                 for event in self.results_by_id[ae.id]:
                     on_event(event)
@@ -364,7 +455,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         (condenser, UI, etc.) and also prevent accidentally materializing the full
         event history during initialization.
         """
-        super().init_state(state, on_event=on_event)
+        self._initialize(state)
 
         # Defensive check: Analyze state to detect unexpected initialization scenarios
         # These checks help diagnose issues related to lazy loading and event ordering
@@ -457,7 +548,10 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
 
         This method pulls secrets from the conversation's secret_registry and
         merges them with agent_context to build the dynamic portion of the
-        system prompt.
+        system prompt, assembled from the dynamic-tier sections of the default
+        registry. ``_build_prompt_context`` reproduces the legacy no-agent_context
+        path: with no agent_context but registry secrets present, it resolves a
+        default ``AgentContext()`` so the secrets (and its datetime) still render.
 
         Args:
             state: The conversation state containing the secret_registry.
@@ -468,25 +562,11 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         # Get secret infos from conversation's secret_registry
         secret_infos = state.secret_registry.get_secret_infos()
 
-        if not self.agent_context:
-            # No agent_context but we might have secrets from registry
-            if secret_infos:
-                from openhands.sdk.context.agent_context import AgentContext
-
-                # Create a minimal context just for secrets
-                temp_context = AgentContext()
-                return temp_context.get_system_message_suffix(
-                    llm_model=self.llm.model,
-                    llm_model_canonical=self.llm.model_canonical_name,
-                    additional_secret_infos=secret_infos,
-                )
-            return None
-
-        return self.agent_context.get_system_message_suffix(
-            llm_model=self.llm.model,
-            llm_model_canonical=self.llm.model_canonical_name,
-            additional_secret_infos=secret_infos,
-        )
+        ctx = self._build_prompt_context(additional_secret_infos=secret_infos)
+        # The dynamic tier is preset-independent; fall back to the default tier for a
+        # custom Jinja template (preset None), as before.
+        preset = self._prompt_preset or PromptPreset.DEFAULT
+        return create_registry(preset).build(ctx).dynamic
 
     def _execute_actions(
         self,
@@ -503,8 +583,9 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             tool_runner=lambda ae: self._execute_action_event(conversation, ae),
             tools=self.tools_map,
             cancel_token=conversation.cancel_token,
+            span_owner=conversation,
         )
-        batch.emit(on_event)
+        batch.emit(conversation, on_event)
         batch.finalize(
             on_event=on_event,
             check_iterative_refinement=lambda ae: (
@@ -537,8 +618,9 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             tool_runner=lambda ae: self._execute_action_event(conversation, ae),
             tools=self.tools_map,
             cancel_token=conversation.cancel_token,
+            span_owner=conversation,
         )
-        batch.emit(on_event)
+        batch.emit(conversation, on_event)
         batch.finalize(
             on_event=on_event,
             check_iterative_refinement=lambda ae: (
@@ -561,7 +643,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         state = conversation.state
         # Check for pending actions (implicit confirmation)
         # and execute them before sampling new actions.
-        pending_actions = ConversationState.get_unmatched_actions(state.events)
+        pending_actions = ConversationState.get_unmatched_actions(state.active_branch())
         if pending_actions:
             logger.info(
                 "Confirmation mode: Executing %d pending action(s)",
@@ -584,9 +666,19 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 "skipping hook check for legacy conversation state."
             )
 
-        # Prepare LLM messages using the utility function
+        # Build per-conversation context once and thread it through all
+        # LLM calls in this step (avoids shared mutable state on the LLM).
+        call_context: LLMCallContext = conversation.get_llm_call_context()
+
+        # Establish route-aware runtime metadata (cached, no I/O on a hit)
+        # before the condenser decides a token threshold, so a routed model's
+        # real endpoint limit drives condensation on the first step.
+        self.llm.resolve_runtime_metadata()
+
+        # Prepare LLM messages from the cached, incrementally-maintained view.
+        # See https://github.com/OpenHands/software-agent-sdk/issues/3053.
         _messages_or_condensation = prepare_llm_messages(
-            state.events, condenser=self.condenser, llm=self.llm
+            state.view, condenser=self.condenser, llm=self.llm
         )
 
         # Process condensation event before agent sampels another action
@@ -595,6 +687,29 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             return
 
         _messages = _messages_or_condensation
+
+        if _should_handle_non_multimodal_image_input(self.llm, _messages):
+            if VISION_INSPECT_TOOL_NAME in self.tools_map:
+                logger.info(
+                    "Image input received by non-vision model %s; exposing "
+                    "image references and vision inspection tool",
+                    self.llm.model,
+                )
+                _messages = _replace_latest_user_images_with_references(_messages)
+            else:
+                logger.info(
+                    "Image input received while selected model does not support "
+                    "vision: %s",
+                    self.llm.model,
+                )
+                on_event(
+                    MessageEvent(
+                        source="agent",
+                        llm_message=_non_multimodal_image_message(self.llm.model),
+                    )
+                )
+                state.execution_status = ConversationExecutionStatus.FINISHED
+                return
 
         logger.debug(
             "Sending messages to LLM: "
@@ -607,6 +722,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 _messages,
                 tools=list(self.tools_map.values()),
                 on_token=on_token,
+                call_context=call_context,
             )
         except FunctionCallValidationError as e:
             logger.warning(f"LLM generated malformed function call: {e}")
@@ -618,6 +734,28 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 ),
             )
             on_event(error_message)
+            return
+        except LLMContentPolicyViolationError as e:
+            # Content-policy blocks are deterministic; nudge the model and let the
+            # run loop continue instead of emitting a fatal error.
+            logger.warning(f"LLM output blocked by content filter: {e}")
+            on_event(
+                MessageEvent(
+                    source="user",
+                    llm_message=Message(
+                        role="user",
+                        content=[
+                            TextContent(
+                                text=(
+                                    "Your previous response was blocked by the "
+                                    "model's content filter. Please continue, "
+                                    "rephrasing to avoid the flagged content."
+                                )
+                            )
+                        ],
+                    ),
+                )
+            )
             return
         except LLMMalformedConversationHistoryError as e:
             # The provider rejected the current message history as structurally
@@ -634,6 +772,10 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     "triggering condensation retry with condensed history: "
                     f"{e}"
                 )
+                # The incremental view may itself be the source of the
+                # malformed history.  Re-derive with full enforcement so
+                # the condenser operates on a clean view.
+                state.rebuild_view()
                 on_event(CondensationRequest())
                 return
             logger.warning(
@@ -681,6 +823,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     response_type=response_type,
                 )
 
+    @observe(name="agent.astep", ignore_inputs=["state", "on_event"])
     async def astep(
         self,
         conversation: LocalConversation,
@@ -698,7 +841,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         """
         state = conversation.state
         # Check for pending actions (implicit confirmation)
-        pending_actions = ConversationState.get_unmatched_actions(state.events)
+        pending_actions = ConversationState.get_unmatched_actions(state.active_branch())
         if pending_actions:
             logger.info(
                 "Confirmation mode: Executing %d pending action(s)",
@@ -719,8 +862,17 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 "skipping hook check for legacy conversation state."
             )
 
+        call_context: LLMCallContext = conversation.get_llm_call_context()
+
+        # Establish route-aware runtime metadata (cached, no I/O on a hit)
+        # before the condenser decides a token threshold, so a routed model's
+        # real endpoint limit drives condensation on the first step.
+        await self.llm.aresolve_runtime_metadata()
+
+        # Prepare LLM messages from the cached, incrementally-maintained view.
+        # See https://github.com/OpenHands/software-agent-sdk/issues/3053.
         _messages_or_condensation = await aprepare_llm_messages(
-            state.events, condenser=self.condenser, llm=self.llm
+            state.view, condenser=self.condenser, llm=self.llm
         )
 
         if isinstance(_messages_or_condensation, Condensation):
@@ -729,18 +881,46 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
 
         _messages = _messages_or_condensation
 
+        if _should_handle_non_multimodal_image_input(self.llm, _messages):
+            if VISION_INSPECT_TOOL_NAME in self.tools_map:
+                logger.info(
+                    "Image input received by non-vision model %s; exposing "
+                    "image references and vision inspection tool",
+                    self.llm.model,
+                )
+                _messages = _replace_latest_user_images_with_references(_messages)
+            else:
+                logger.info(
+                    "Image input received while selected model does not support "
+                    "vision: %s",
+                    self.llm.model,
+                )
+                on_event(
+                    MessageEvent(
+                        source="agent",
+                        llm_message=_non_multimodal_image_message(self.llm.model),
+                    )
+                )
+                state.execution_status = ConversationExecutionStatus.FINISHED
+                return
+
         logger.debug(
             "Sending messages to LLM: "
             f"{json.dumps([m.model_dump() for m in _messages[1:]], indent=2)}"
         )
 
         try:
-            llm_response = await amake_llm_completion(
-                self.llm,
-                _messages,
-                tools=list(self.tools_map.values()),
-                on_token=on_token,
-            )
+            # Release the state lock for just the network wait so send_message()
+            # and state snapshots aren't blocked for the whole response. No-op
+            # unless the run loop holds the lock (e.g. direct astep() in tests).
+            async with conversation._released_state_lock_during_io():
+                llm_response = await amake_llm_completion(
+                    self.llm,
+                    _messages,
+                    tools=list(self.tools_map.values()),
+                    on_token=on_token,
+                    call_context=call_context,
+                )
         except FunctionCallValidationError as e:
             logger.warning(f"LLM generated malformed function call: {e}")
             error_message = MessageEvent(
@@ -751,6 +931,28 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 ),
             )
             on_event(error_message)
+            return
+        except LLMContentPolicyViolationError as e:
+            # Content-policy blocks are deterministic; nudge the model and let the
+            # run loop continue instead of emitting a fatal error.
+            logger.warning(f"LLM output blocked by content filter: {e}")
+            on_event(
+                MessageEvent(
+                    source="user",
+                    llm_message=Message(
+                        role="user",
+                        content=[
+                            TextContent(
+                                text=(
+                                    "Your previous response was blocked by the "
+                                    "model's content filter. Please continue, "
+                                    "rephrasing to avoid the flagged content."
+                                )
+                            )
+                        ],
+                    ),
+                )
+            )
             return
         except LLMMalformedConversationHistoryError as e:
             # The provider rejected the current message history as
@@ -769,6 +971,9 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                     "history: %s",
                     e,
                 )
+                # Mirror step(): re-derive the cached view with full
+                # enforcement before the condensation retry.
+                state.rebuild_view()
                 on_event(CondensationRequest())
                 return
             logger.warning(
@@ -939,6 +1144,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         *,
         error: str,
         tool_name: str,
+        span_name: str,
+        conversation: LocalConversation,
         tool_call: MessageToolCall,
         llm_response_id: str,
         on_event: ConversationCallbackType,
@@ -947,6 +1154,20 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         thinking_blocks: list[ThinkingBlock | RedactedThinkingBlock] | None = None,
         responses_reasoning_item: ReasoningItemModel | None = None,
     ) -> None:
+        try:
+            json.loads(tool_call.arguments)
+        except json.JSONDecodeError:
+            tool_call = tool_call.model_copy(
+                update={
+                    "arguments": json.dumps(
+                        {
+                            "_openhands_malformed_tool_call": True,
+                            "error": error,
+                        }
+                    )
+                }
+            )
+
         tc_event = ActionEvent(
             source="agent",
             thought=thought or [],
@@ -960,13 +1181,20 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             action=None,
         )
         on_event(tc_event)
-        on_event(
-            AgentErrorEvent(
-                error=error,
-                tool_name=tool_name,
-                tool_call_id=tool_call.id,
-            )
+        error_event = AgentErrorEvent(
+            error=error,
+            tool_name=tool_name,
+            tool_call_id=tool_call.id,
+            classification=AGENT_OUTCOME,
         )
+        record_tool_result(
+            conversation,
+            name=span_name,
+            tool_call_id=tool_call.id,
+            tool_input=tool_call,
+            tool_output=error_event.to_llm_message(),
+        )
+        on_event(error_event)
 
     def _get_action_event(
         self,
@@ -1012,6 +1240,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 self._emit_tool_error(
                     error=err,
                     tool_name=tool_name,
+                    span_name="InvalidToolCall",
+                    conversation=conversation,
                     tool_call=tool_call,
                     llm_response_id=llm_response_id,
                     on_event=on_event,
@@ -1023,6 +1253,10 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 return
 
             arguments = fix_malformed_tool_arguments(arguments, tool.action_type)
+            if tool.response_schema is not None:
+                arguments = fix_malformed_tool_arguments(
+                    arguments, tool.response_schema
+                )
             normalized_tool_call = tool_call.model_copy(
                 update={
                     "name": tool_name,
@@ -1068,6 +1302,8 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             self._emit_tool_error(
                 error=err,
                 tool_name=display_tool_name,
+                span_name=(tool.action_type.__name__ if tool else "InvalidToolCall"),
+                conversation=conversation,
                 tool_call=tool_call,
                 llm_response_id=llm_response_id,
                 on_event=on_event,
@@ -1135,9 +1371,14 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         try:
             if should_enable_observability():
                 tool_name = extract_action_name(action_event)
-                observation: Observation = observe(name=tool_name, span_type="TOOL")(
-                    tool
-                )(action_event.action, conversation)
+                observation: Observation = observe(
+                    name=tool_name,
+                    span_type="TOOL",
+                    # Only the action is input; the conversation would serialize
+                    # as a bare object repr carrying a memory address.
+                    ignore_inputs=["conversation"],
+                    metadata={"tool_call_id": action_event.tool_call.id},
+                )(tool)(action_event.action, conversation)
             else:
                 observation = tool(action_event.action, conversation)
             assert isinstance(observation, Observation), (
@@ -1152,6 +1393,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
                 error=err,
                 tool_name=tool.name,
                 tool_call_id=action_event.tool_call.id,
+                classification=AGENT_OUTCOME,
             )
             return [error_event]
 

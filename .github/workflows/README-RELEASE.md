@@ -63,10 +63,12 @@ You can monitor the progress in the [Actions tab](https://github.com/OpenHands/s
 In parallel with the PyPI workflow, **release-binaries.yml** also fires on `release: published`.
 It also runs on every push to `main` as ongoing smoke coverage. It:
 
-- ✅ Builds the agent-server PyInstaller binary on a 4-runner matrix
-  (linux x86_64/arm64, macOS x86_64/arm64) and smoke-tests each
-- ✅ Generates a combined `SHA256SUMS` and attaches all artifacts to the GitHub
-  release as `agent-server-<version>-<os>-<arch>` on release/manual runs
+- ✅ Builds the agent-server PyInstaller binary on a 5-runner matrix
+  (linux x86_64/arm64, macOS x86_64/arm64, windows x86_64) and smoke-tests each
+- ✅ Exports and validates the deterministic public Agent Server contract as
+  `openapi.json`, with `info.version` matching the release version
+- ✅ Generates a combined `SHA256SUMS` and attaches the binaries and
+  `openapi.json` to the GitHub release on release/manual runs
 - ✅ Verifies that the multi-arch Docker manifest
   `ghcr.io/openhands/agent-server:<image-tag>-<variant>` published by
   `server.yml` covers both `linux/amd64` and `linux/arm64` for every variant
@@ -74,15 +76,16 @@ It also runs on every push to `main` as ongoing smoke coverage. It:
 - ✅ Pulls each variant on each architecture with `--platform=linux/<arch>`,
   boots the container, and asserts `/health` responds
 
-On `push` events, `<image-tag>` is the 7-character commit SHA and binaries
-remain as workflow artifacts only. On release/manual runs, `<image-tag>` is the
-release version and the binaries are uploaded to the GitHub release.
+On `push` events, `<image-tag>` is the 7-character commit SHA and binaries plus
+`openapi.json` remain as workflow artifacts only. On release/manual runs,
+`<image-tag>` is the release version and the binaries plus `openapi.json` are
+uploaded to the GitHub release.
 
 #### Build time / runner expectations
 
 | Stage | Runtime (typical) | Runners |
 |---|---|---|
-| Binary builds (4-way matrix, parallel) | ~10–15 min on Linux, ~12–18 min on macOS | `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-13`, `macos-14` |
+| Binary builds (5-way matrix, parallel) | ~10–15 min on Linux, ~12–18 min on macOS | `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel`, `macos-14`, `windows-2022` |
 | `publish-binaries` (download + checksum + upload) | ~1–2 min | `ubuntu-24.04` |
 | `docker-smoke-test` (6-way matrix, parallel) | Up to 45 min (mostly polling for the docker images) | `ubuntu-24.04` for amd64, `ubuntu-24.04-arm` for arm64 |
 
@@ -104,19 +107,21 @@ If the matching manifest is already in GHCR, the wait step exits immediately.
 
 After successful PyPI publication, the workflow will automatically create PRs to update SDK versions in downstream repositories:
 
-- **[OpenHands](https://github.com/All-Hands-AI/OpenHands)** - Updates `openhands-sdk`, `openhands-tools`, and `openhands-agent-server` versions
-- **[OpenHands-CLI](https://github.com/All-Hands-AI/openhands-cli)** - Updates `openhands-sdk` and `openhands-tools` versions
+- **[OpenHands-CLI](https://github.com/OpenHands/openhands-cli)** - Updates `openhands-sdk` and `openhands-tools` versions
+- **[automation](https://github.com/OpenHands/automation)** - Updates `openhands-sdk` and `openhands-workspace` versions. Opened with a `fix:` title so the repo's release-please cuts a patch release, publishing an `openhands-automation` build pinned to this SDK (which the agent-canvas `sdk-version-sync` check requires).
+- **TypeScript client (`clients/typescript`)** - Opens a PR in this repository after both the exact GHCR image and release `openapi.json` are available, updates `config.agentServerImage`, regenerates the checked-in transport types, and includes an API-change summary.
 
 These PRs will:
-- Be created automatically with branch name `bump-sdk-X.Y.Z`
+- Be created automatically with branch name `bump-sdk-X.Y.Z` (`bump-agent-server-X.Y.Z` for typescript-client)
 - Include links back to the SDK release
-- Need to be reviewed and merged by the respective repository maintainers
+- Include generated Agent Server contract changes for the exact released
+  version rather than only changing the image tag
+- Need to be reviewed and merged by maintainers
 
 ### Step 6: Post-Release Tasks
 
 - [ ] Merge the release PR to main
-- [ ] Review and merge the auto-created version bump PRs in OpenHands and OpenHands-CLI
-- [ ] Run evaluation on OpenHands Index (manual step)
+- [ ] Review and merge the auto-created version bump PRs in OpenHands-CLI, automation, and the TypeScript client (merging the automation PR triggers its release-please release PR; merge that too to publish the pinned `openhands-automation`)
 - [ ] Announce the release
 
 ## Manual PyPI Release (If Needed)
@@ -181,6 +186,5 @@ For reference, the previous manual release checklist was:
 - [ ] Tag "test-examples" and make sure example checks all pass
 - [ ] Draft a new release
 - [ ] Use workflow to publish to PyPI on tag `v1.X.X`
-- [ ] Evaluation on OpenHands Index
 
 Most of these steps are now automated!

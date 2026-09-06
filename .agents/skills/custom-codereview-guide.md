@@ -9,6 +9,12 @@ triggers:
 
 You are an expert code reviewer for the **OpenHands/software-agent-sdk** repository. This skill provides repo-specific review guidelines. Be direct but constructive.
 
+## Repository Boundaries
+
+This repository owns the Python SDK and Agent Server: agent/tool behavior, conversations, workspaces, events, and the canonical REST/WebSocket API. `clients/typescript/` mirrors the API for browser-compatible clients, [`OpenHands/OpenHands`](https://github.com/OpenHands/OpenHands) owns Agent Canvas, and [`OpenHands/extensions`](https://github.com/OpenHands/extensions) owns reusable skills, plugins, automations, and integrations; [`OpenHands/automation`](https://github.com/OpenHands/automation) owns scheduling, webhooks, run history, dispatch, and sandbox orchestration.
+
+The normal flow is SDK/Agent Server → OpenAPI contract → `typescript-client` → Agent Canvas. Review whether each change is in the repository that owns it. If a PR is opened in the wrong repository, explicitly recommend that it may need to be closed and moved to the owning repository instead of merged here.
+
 ## Review Decisions
 
 You have permission to **APPROVE** or **COMMENT** on PRs. Do not use REQUEST_CHANGES.
@@ -104,6 +110,36 @@ Examples:
 - A PR adding a new model to `resolve_model_config.py` or `verified_models.py` with corresponding test updates
 - A PR adding documentation notes to docstrings clarifying method behavior (e.g., security considerations, bypass behaviors)
 - A PR changing CI runners or fixing workflow infrastructure issues (e.g., standardizing runner types to fix path inconsistencies)
+
+### Special rule: live preflight failures for newly-added models
+
+PRs that only add an entry to `.github/run-eval/resolve_model_config.py` (and
+the matching test in `tests/cross/test_resolve_model_config.py`) interact with
+the LiteLLM proxy at `LLM_BASE_URL` (default
+`https://llm-proxy.eval.all-hands.dev`). Provisioning a new model name on that
+proxy is done **out-of-band**, not in the PR.
+
+A live preflight call that returns
+`Invalid model name passed in model=<provider>/<name>` for a model the PR is
+introducing is therefore **not** evidence that the PR is broken — it is most
+likely transient proxy-provisioning lag.
+
+When reviewing or QA-ing such a PR:
+
+- Do **not** post `❌ QA Report: FAIL` purely because the live preflight
+  rejected the new model name.
+- Do **not** open or re-open a 🔴 Critical inline thread on the new model
+  entry purely on the basis of `Invalid model name` from the live proxy.
+- Treat any of the following as authoritative validation instead:
+  1. A successful integration-runner workflow run for this PR.
+  2. A run for this model on
+     [openhands-eval-monitor.vercel.app](https://openhands-eval-monitor.vercel.app/).
+  3. The author's explicit confirmation (e.g. screenshot) that the model is
+     reachable via the proxy.
+
+Real preflight blockers still apply (parameter conflicts on Claude, bad
+`litellm_extra_body`, unit-test failures, regressions on existing models —
+see `.github/run-eval/AGENTS.md` "What still IS a real preflight blocker").
 
 ### When to COMMENT
 

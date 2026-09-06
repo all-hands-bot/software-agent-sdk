@@ -1,3 +1,4 @@
+import json
 import os
 from collections.abc import Generator
 from pathlib import Path
@@ -11,6 +12,7 @@ from pydantic import PrivateAttr, ValidationError
 
 from openhands.sdk.git.models import GitChange, GitDiff
 from openhands.sdk.logger import get_logger
+from openhands.sdk.mcp.config import MCPServer
 from openhands.sdk.settings import SecretsListResponse, SettingsResponse
 from openhands.sdk.workspace.base import BaseWorkspace
 from openhands.sdk.workspace.models import CommandResult, FileOperationResult
@@ -69,7 +71,6 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
     """
 
     _client: httpx.Client | None = PrivateAttr(default=None)
-    _conversation_id: str | None = PrivateAttr(default=None)
 
     def reset_client(self) -> None:
         """Reset the HTTP client to force re-initialization.
@@ -243,13 +244,43 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
     def default_conversation_tags(self) -> dict[str, str] | None:
         """Default tags to apply to conversations created with this workspace.
 
-        Subclasses (e.g., OpenHandsCloudWorkspace) can override this to provide
-        context-specific tags like automation metadata.
+        Derives automation metadata from environment variables injected by the
+        automation dispatcher, so any remote workspace (local agent servers
+        included) stamps automation context onto the conversations it creates.
+
+        The tags include (keys are lowercase alphanumeric per API requirements):
+          - automationtrigger: The trigger type (e.g., 'cron', 'webhook', 'manual')
+          - automationid: The automation's unique identifier
+          - automationname: Human-readable automation name
+          - automationrunid: The specific run identifier
 
         Returns:
-            Dictionary of tag key-value pairs, or None if no default tags.
+            Dictionary of tag key-value pairs (empty when no automation env
+            vars are present). Subclasses (e.g., OpenHandsCloudWorkspace) can
+            extend this with additional context.
         """
-        return None
+        tags: dict[str, str] = {}
+
+        # Parse AUTOMATION_EVENT_PAYLOAD (injected by dispatcher)
+        payload_str = os.environ.get("AUTOMATION_EVENT_PAYLOAD")
+        if payload_str:
+            try:
+                payload = json.loads(payload_str)
+                if isinstance(payload, dict):
+                    if payload.get("trigger"):
+                        tags["automationtrigger"] = str(payload["trigger"])
+                    if payload.get("automation_id"):
+                        tags["automationid"] = str(payload["automation_id"])
+                    if payload.get("automation_name"):
+                        tags["automationname"] = str(payload["automation_name"])
+            except (json.JSONDecodeError, TypeError):
+                logger.error("Failed to parse AUTOMATION_EVENT_PAYLOAD")
+
+        run_id = os.environ.get("AUTOMATION_RUN_ID")
+        if run_id:
+            tags["automationrunid"] = run_id
+
+        return tags
 
     def register_conversation(self, conversation_id: str) -> None:
         """Register a conversation ID with this workspace.
@@ -273,54 +304,6 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
         """
         return self._conversation_id
 
-    def _send_completion_callback(
-        self, exc_type: type | None, exc_val: BaseException | None
-    ) -> None:
-        """POST completion status to the automation service (best-effort).
-
-        Call this from ``__exit__`` before ``cleanup()``. Does nothing when
-        ``AUTOMATION_CALLBACK_URL`` env var is not set.
-
-        Reads configuration from environment variables:
-          - ``AUTOMATION_CALLBACK_URL`` — URL to POST completion status to
-          - ``AUTOMATION_CALLBACK_API_KEY`` — Bearer token for callback auth (optional)
-          - ``AUTOMATION_RUN_ID`` — Run ID to include in callback payload (optional)
-
-        Includes ``conversation_id`` in the payload if one was registered via
-        ``register_conversation()``.
-
-        Args:
-            exc_type: Exception type if an exception was raised, None otherwise
-            exc_val: Exception value if an exception was raised, None otherwise
-        """
-        callback_url = os.environ.get("AUTOMATION_CALLBACK_URL")
-        if not callback_url:
-            return
-
-        callback_api_key = os.environ.get("AUTOMATION_CALLBACK_API_KEY")
-        run_id = os.environ.get("AUTOMATION_RUN_ID")
-
-        status = "COMPLETED" if exc_type is None else "FAILED"
-        payload: dict[str, Any] = {"status": status}
-        if run_id:
-            payload["run_id"] = run_id
-        if exc_val is not None:
-            payload["error"] = str(exc_val)
-
-        # Include conversation_id if one was registered
-        if self._conversation_id is not None:
-            payload["conversation_id"] = self._conversation_id
-
-        try:
-            headers: dict[str, str] = {}
-            if callback_api_key:
-                headers["Authorization"] = f"Bearer {callback_api_key}"
-            with httpx.Client(timeout=10.0) as cb_client:
-                resp = cb_client.post(callback_url, json=payload, headers=headers)
-                logger.info(f"Completion callback sent ({status}): {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"Completion callback failed: {e}")
-
     def __exit__(
         self, exc_type: type | None, exc_val: BaseException | None, exc_tb: Any
     ) -> None:
@@ -338,27 +321,30 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
     # settings endpoints. Subclasses like OpenHandsCloudWorkspace may override
     # to use alternative endpoints (e.g., Cloud API).
 
-    def _fetch_agent_settings(
-        self,
-    ) -> "OpenHandsAgentSettings | LLMAgentSettings | ACPAgentSettings":
-        """Call ``GET /api/settings`` and return a validated settings model.
-
-        Uses ``X-Expose-Secrets: plaintext`` so secret fields (e.g. LLM
-        api_key) are returned as plain strings.  The outer response is
-        validated via :class:`SettingsResponse`, then the ``agent_settings``
-        dict is validated through :meth:`SettingsResponse.get_agent_settings`,
-        which applies the persisted settings migration entry point before
-        picking the correct discriminated-union variant
-        (``OpenHandsAgentSettings`` or ``ACPAgentSettings``).
-        """
+    def _fetch_settings_response(
+        self, *, expose_secrets: bool = True
+    ) -> SettingsResponse:
+        """Call ``GET /api/settings`` and return the validated response."""
         headers = dict(self._headers)
-        headers["X-Expose-Secrets"] = "plaintext"
+        if expose_secrets:
+            headers["X-Expose-Secrets"] = "plaintext"
 
         response = self.client.get("/api/settings", headers=headers)
         response.raise_for_status()
+        return SettingsResponse.model_validate(response.json())
 
-        data = SettingsResponse.model_validate(response.json())
-        return data.get_agent_settings()
+    def _fetch_agent_settings(
+        self,
+    ) -> "OpenHandsAgentSettings | LLMAgentSettings | ACPAgentSettings":
+        """Return the validated agent settings from ``GET /api/settings``.
+
+        Uses ``X-Expose-Secrets: plaintext`` so secret fields (e.g. LLM
+        api_key) are returned as plain strings. The validated
+        ``SettingsResponse`` is narrowed through
+        :meth:`SettingsResponse.get_agent_settings`, which selects the correct
+        discriminated-union variant.
+        """
+        return self._fetch_settings_response().get_agent_settings()
 
     def _fetch_llm_profile_config(self, profile_name: str) -> dict[str, Any]:
         """Call ``GET /api/profiles/{name}`` and return plaintext LLM config."""
@@ -385,16 +371,23 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
         reraise=True,
     )
     def get_llm(self, profile_name: str | None = None, **llm_kwargs: Any) -> "LLM":
-        """Fetch LLM settings from persisted settings or a named profile.
+        """Fetch the active or explicitly named LLM profile.
+
+        When no ``profile_name`` is given, the persisted ``active_profile``
+        pointer is resolved first (so the UI-advertised default is honored).
+        If no ``active_profile`` is configured, the legacy
+        ``agent_settings.llm`` payload is used as a fallback (preserving
+        backward compatibility for servers that have not adopted named
+        profiles).
 
         Args:
             profile_name: Optional LLM profile name. When provided, loads that
-                named profile instead of the active persisted LLM settings.
-            **llm_kwargs: Additional keyword arguments that override persisted
-                or profile values (e.g., ``model``, ``temperature``).
+                named profile instead of resolving the active profile.
+            **llm_kwargs: Additional keyword arguments that override profile
+                values (e.g., ``model``, ``temperature``).
 
         Returns:
-            An LLM instance configured with the persisted settings or profile.
+            An LLM instance configured with the active or named profile.
 
         Raises:
             FileNotFoundError: If ``profile_name`` does not exist.
@@ -411,14 +404,23 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
         if not self.host or self.host == "undefined":
             raise RuntimeError("Workspace host is not set")
 
-        if profile_name:
+        if profile_name is None:
+            settings_response = self._fetch_settings_response(expose_secrets=False)
+            resolved_profile_name = settings_response.active_profile
+            if resolved_profile_name in (None, ""):
+                settings_response = self._fetch_settings_response()
+                agent_settings = settings_response.get_agent_settings()
+                if not llm_kwargs:
+                    return agent_settings.llm
+                llm_data = agent_settings.llm.model_dump(
+                    context={"expose_secrets": "plaintext"}
+                )
+            else:
+                llm_data = self._fetch_llm_profile_config(resolved_profile_name)
+                llm_data["usage_id"] = f"profile:{resolved_profile_name}"
+        else:
             llm_data = self._fetch_llm_profile_config(profile_name)
             llm_data["usage_id"] = f"profile:{profile_name}"
-        else:
-            settings = self._fetch_agent_settings()
-            if not llm_kwargs:
-                return settings.llm
-            llm_data = settings.llm.model_dump(context={"expose_secrets": "plaintext"})
 
         llm_data.update(llm_kwargs)
         return LLM(**llm_data)
@@ -489,17 +491,16 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
         retry=tenacity.retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    def get_mcp_config(self) -> dict[str, Any]:
-        """Fetch MCP configuration from the agent-server's persisted settings.
+    def get_mcp_config(self) -> dict[str, MCPServer]:
+        """Fetch MCP servers from the agent-server's persisted settings.
 
         Calls ``GET /api/settings`` with ``X-Expose-Secrets: plaintext`` header
-        to retrieve the MCP configuration and returns a dict compatible with
-        ``MCPConfig.model_validate()`` and the ``Agent(mcp_config=...)`` kwarg.
+        to retrieve the MCP servers and returns a dict compatible with the
+        ``Agent(mcp_config=...)`` kwarg.
 
         Returns:
-            A dictionary with ``mcpServers`` key containing server configurations
-            (compatible with ``MCPConfig.model_validate()``), or an empty dict
-            if no MCP config is set.
+            A dictionary mapping server names to server configurations, or an
+            empty dict if no MCP servers are configured.
 
         Raises:
             httpx.HTTPStatusError: If the API request fails.
@@ -510,10 +511,6 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
             ...     llm = workspace.get_llm()
             ...     mcp_config = workspace.get_mcp_config()
             ...     agent = Agent(llm=llm, mcp_config=mcp_config, tools=...)
-            ...
-            ...     # Or validate as MCPConfig:
-            ...     from fastmcp.mcp_config import MCPConfig
-            ...     config = MCPConfig.model_validate(mcp_config)
         """
         from openhands.sdk.settings import OpenHandsAgentSettings
 
@@ -522,14 +519,11 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
 
         settings = self._fetch_agent_settings()
 
-        # mcp_config only exists on OpenHandsAgentSettings, not ACPAgentSettings
+        # Runtime MCP tools only exist on OpenHandsAgentSettings, not ACPAgentSettings.
         if not isinstance(settings, OpenHandsAgentSettings):
             return {}
 
-        if settings.mcp_config is None:
-            return {}
-
-        return settings.mcp_config.model_dump(exclude_none=True, exclude_defaults=True)
+        return settings.mcp_config
 
     # ── Repository Cloning Methods ─────────────────────────────────────────
 
@@ -698,7 +692,6 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
             "load_project": load_project,
             "load_org": load_org,
             "project_dir": project_dir,
-            "org_config": None,
             "sandbox_config": None,
         }
 
