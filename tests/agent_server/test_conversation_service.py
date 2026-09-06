@@ -3633,6 +3633,37 @@ class TestACPActivityHeartbeatWiring:
         assert not hasattr(agent, "_on_activity")
 
 
+@pytest.mark.asyncio
+async def test_external_catalog_sync_discovers_conversation_added_after_startup(
+    tmp_path, sample_stored_conversation
+):
+    conversations_dir = tmp_path / "conversations"
+    async with ConversationService(
+        conversations_dir=conversations_dir, sync_external_catalog=True
+    ) as service:
+        assert (await service.search_conversations()).items == []
+
+        conversation_dir = conversations_dir / sample_stored_conversation.id.hex
+        conversation_dir.mkdir(parents=True)
+        (conversation_dir / "meta.json").write_text(
+            sample_stored_conversation.model_dump_json()
+        )
+        state = ConversationState(
+            id=sample_stored_conversation.id,
+            agent=_sample_agent(),
+            workspace=sample_stored_conversation.workspace,
+            persistence_dir=str(conversations_dir),
+        )
+        (conversation_dir / "base_state.json").write_text(state.model_dump_json())
+
+        info = await service.get_conversation(sample_stored_conversation.id)
+        page = await service.search_conversations()
+
+    assert info is not None
+    assert info.id == sample_stored_conversation.id
+    assert [item.id for item in page.items] == [sample_stored_conversation.id]
+
+
 def _branch_events(conversation) -> list:
     """Log events excluding async ``ConversationStateUpdateEvent`` artifacts.
 
