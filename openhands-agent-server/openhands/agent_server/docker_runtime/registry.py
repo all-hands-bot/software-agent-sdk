@@ -11,6 +11,7 @@ a lease — it reads metadata off disk and proxies all mutations.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import random
 import socket
@@ -34,6 +35,15 @@ logger = get_logger(__name__)
 # via ``OH_CONVERSATIONS_PATH`` / ``OH_PERSISTENCE_DIR`` to use these.
 _CONTAINER_CONV_DIR = "/var/openhands/conversations"
 _CONTAINER_PERSIST_DIR = "/var/openhands/.openhands"
+_RUNTIME_OWNER_LABEL = "ai.openhands.runtime-owner"
+_CONVERSATION_ID_LABEL = "ai.openhands.conversation-id"
+
+
+def _execution_scope(config: Config) -> str:
+    conversations_path = config.conversations_path.resolve()
+    persistence_path = _get_persistence_dir(config).resolve()
+    identity = f"{conversations_path}\0{persistence_path}"
+    return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
 
 @dataclass(slots=True)
@@ -71,6 +81,7 @@ class DockerConversationRegistry:
 
     def __init__(self, config: Config) -> None:
         self._config = config
+        self._execution_scope = _execution_scope(config)
         self._containers: dict[UUID, RunningConversationContainer] = {}
         self._starts: dict[UUID, asyncio.Task[RunningConversationContainer]] = {}
         self._lock = asyncio.Lock()
@@ -78,6 +89,35 @@ class DockerConversationRegistry:
     @property
     def config(self) -> Config:
         return self._config
+
+    @property
+    def execution_scope(self) -> str:
+        return self._execution_scope
+
+    def cleanup_stale_containers(self) -> None:
+        """Remove containers left by an earlier instance of this runtime."""
+        result = execute_command(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"label={_RUNTIME_OWNER_LABEL}={self._execution_scope}",
+            ]
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Failed to list stale conversation containers: %s", result.stderr
+            )
+            return
+        container_ids = result.stdout.split()
+        if not container_ids:
+            return
+        cleanup = execute_command(["docker", "rm", "-f", *container_ids])
+        if cleanup.returncode != 0:
+            logger.warning(
+                "Failed to remove stale conversation containers: %s", cleanup.stderr
+            )
 
     def get(self, conversation_id: UUID) -> RunningConversationContainer | None:
         return self._containers.get(conversation_id)
@@ -206,6 +246,7 @@ class DockerConversationRegistry:
         )
         shared_session_key = os.environ.get(V1_SESSION_API_KEY_ENV)
         container = self._run_container(
+            conversation_id=conversation_id,
             image=cfg.conversation_image,
             platform=cfg.conversation_container_platform,
             volumes=volumes,
@@ -247,6 +288,7 @@ class DockerConversationRegistry:
     def _run_container(
         self,
         *,
+        conversation_id: UUID,
         image: str,
         platform: str,
         volumes: list[str],
@@ -274,6 +316,15 @@ class DockerConversationRegistry:
             logger.info("Adding conversation container volume mount: %s", volume)
         if network:
             flags += ["--network", network]
+        if self._config.conversation_container_memory:
+            flags += ["--memory", self._config.conversation_container_memory]
+        if self._config.conversation_container_cpus is not None:
+            flags += ["--cpus", str(self._config.conversation_container_cpus)]
+        if self._config.conversation_container_pids_limit is not None:
+            flags += [
+                "--pids-limit",
+                str(self._config.conversation_container_pids_limit),
+            ]
 
         host = f"http://127.0.0.1:{port}"
         run_cmd = [
@@ -285,6 +336,14 @@ class DockerConversationRegistry:
             "--user",
             f"{os.getuid()}:{os.getgid()}",
             "--rm",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--label",
+            f"{_RUNTIME_OWNER_LABEL}={self._execution_scope}",
+            "--label",
+            f"{_CONVERSATION_ID_LABEL}={conversation_id}",
             "--ulimit",
             "nofile=65536:65536",
             "--name",

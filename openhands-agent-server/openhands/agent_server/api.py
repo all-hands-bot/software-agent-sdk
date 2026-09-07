@@ -279,6 +279,7 @@ async def api_lifespan(api: FastAPI) -> AsyncIterator[None]:
             docker_registry: DockerConversationRegistry | None = None
             if config.conversation_runtime == "docker":
                 docker_registry = DockerConversationRegistry(config)
+                await asyncio.to_thread(docker_registry.cleanup_stale_containers)
                 api.state.docker_registry = docker_registry
                 logger.info(
                     "Docker conversation runtime enabled (image=%s)",

@@ -380,6 +380,29 @@ class Config(BaseModel):
         default="linux/amd64",
         description="Platform passed to Docker for conversation containers.",
     )
+    conversation_container_memory: str | None = Field(
+        default="4g",
+        description=(
+            "Docker memory limit for each conversation container. Set to null to "
+            "leave memory unconstrained."
+        ),
+    )
+    conversation_container_cpus: float | None = Field(
+        default=2.0,
+        gt=0.0,
+        description=(
+            "Docker CPU limit for each conversation container. Set to null to "
+            "leave CPU unconstrained."
+        ),
+    )
+    conversation_container_pids_limit: int | None = Field(
+        default=512,
+        gt=0,
+        description=(
+            "Maximum processes in each conversation container. Set to null to "
+            "leave the process count unconstrained."
+        ),
+    )
     conversation_container_startup_timeout: float = Field(
         default=120.0,
         gt=0.0,

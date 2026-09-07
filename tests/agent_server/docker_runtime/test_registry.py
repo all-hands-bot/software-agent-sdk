@@ -156,6 +156,7 @@ def test_run_container_uses_host_identity_for_bind_mounts(tmp_path, monkeypatch)
     )
 
     container = registry._run_container(
+        conversation_id=uuid4(),
         image="test-image",
         platform="linux/amd64",
         volumes=["/host/path:/container/path"],
@@ -168,6 +169,88 @@ def test_run_container_uses_host_identity_for_bind_mounts(tmp_path, monkeypatch)
     user_flag = run_command.index("--user")
     assert run_command[user_flag + 1] == f"{os.getuid()}:{os.getgid()}"
     assert container.container_id == "test-container"
+
+
+def test_run_container_applies_ownership_and_security_policy(tmp_path, monkeypatch):
+    registry = DockerConversationRegistry(
+        Config(
+            conversations_path=tmp_path,
+            conversation_container_memory="2g",
+            conversation_container_cpus=2.5,
+            conversation_container_pids_limit=256,
+        )
+    )
+    commands: list[list[str]] = []
+
+    def execute(command, **kwargs):
+        commands.append(command)
+        stdout = "test-container\n" if command[:3] == ["docker", "run", "-d"] else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.execute_command", execute
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.find_available_tcp_port",
+        lambda: 32123,
+    )
+
+    conversation_id = uuid4()
+    registry._run_container(
+        conversation_id=conversation_id,
+        image="test-image",
+        platform="linux/amd64",
+        volumes=[],
+        env={},
+        network=None,
+        api_key=None,
+    )
+
+    run_command = commands[1]
+    assert ["--cap-drop", "ALL"] == run_command[
+        run_command.index("--cap-drop") : run_command.index("--cap-drop") + 2
+    ]
+    assert ["--security-opt", "no-new-privileges"] == run_command[
+        run_command.index("--security-opt") : run_command.index("--security-opt") + 2
+    ]
+    assert run_command[run_command.index("--memory") + 1] == "2g"
+    assert run_command[run_command.index("--cpus") + 1] == "2.5"
+    assert run_command[run_command.index("--pids-limit") + 1] == "256"
+    labels = [
+        run_command[index + 1]
+        for index, value in enumerate(run_command)
+        if value == "--label"
+    ]
+    assert f"ai.openhands.conversation-id={conversation_id}" in labels
+    assert f"ai.openhands.runtime-owner={registry.execution_scope}" in labels
+
+
+def test_cleanup_stale_containers_is_scoped_to_registry_owner(tmp_path, monkeypatch):
+    registry = DockerConversationRegistry(Config(conversations_path=tmp_path))
+    commands: list[list[str]] = []
+
+    def execute(command, **kwargs):
+        commands.append(command)
+        if command[:3] == ["docker", "ps", "-aq"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="owned-a\nowned-b\n", stderr=""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.execute_command", execute
+    )
+
+    registry.cleanup_stale_containers()
+
+    assert commands[0] == [
+        "docker",
+        "ps",
+        "-aq",
+        "--filter",
+        f"label=ai.openhands.runtime-owner={registry.execution_scope}",
+    ]
+    assert commands[1] == ["docker", "rm", "-f", "owned-a", "owned-b"]
 
 
 def test_container_env_forces_inner_runtime_to_local(tmp_path, monkeypatch):
