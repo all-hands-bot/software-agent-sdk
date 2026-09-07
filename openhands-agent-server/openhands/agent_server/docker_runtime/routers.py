@@ -27,6 +27,7 @@ What's intentionally NOT here:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -50,6 +51,7 @@ from openhands.agent_server.docker_runtime.registry import (
     DockerConversationRegistry,
     RunningConversationContainer,
 )
+from openhands.agent_server.utils import safe_rmtree
 from openhands.sdk.logger import get_logger
 
 
@@ -226,6 +228,11 @@ async def docker_delete_conversation(
         logger.warning("Inner DELETE failed for %s: %s", conversation_id, exc)
     finally:
         await registry.stop(conversation_id)
+        await asyncio.to_thread(
+            safe_rmtree,
+            registry.conversation_dir(conversation_id),
+            f"conversation directory for {conversation_id}",
+        )
 
     return Response(
         content=delete_body,

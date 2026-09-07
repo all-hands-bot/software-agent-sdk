@@ -125,6 +125,9 @@ class DockerConversationRegistry:
     def items(self) -> list[tuple[UUID, RunningConversationContainer]]:
         return list(self._containers.items())
 
+    def conversation_dir(self, conversation_id: UUID) -> Path:
+        return host_conv_subdir(self._config, conversation_id)
+
     async def get_or_create(
         self, conversation_id: UUID
     ) -> tuple[RunningConversationContainer, bool]:

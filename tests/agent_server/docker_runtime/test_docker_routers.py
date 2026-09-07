@@ -13,6 +13,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -152,6 +153,7 @@ class _StubRegistry:
 
     port: int
     session_key: str
+    conversations_dir: Path
     _workspaces: dict[UUID, _FakeWorkspace] = field(default_factory=dict)
 
     def _make(self) -> _FakeWorkspace:
@@ -168,6 +170,9 @@ class _StubRegistry:
 
     def get(self, cid: UUID) -> _FakeWorkspace | None:
         return self._workspaces.get(cid)
+
+    def conversation_dir(self, cid: UUID) -> Path:
+        return self.conversations_dir / cid.hex
 
     async def get_or_create(self, cid: UUID) -> tuple[_FakeWorkspace, bool]:
         if cid not in self._workspaces:
@@ -200,7 +205,11 @@ def docker_app(tmp_path):
                 conversations_path=tmp_path / "conversations",
             )
         )
-        app.state.docker_registry = _StubRegistry(port=port, session_key=session_key)
+        app.state.docker_registry = _StubRegistry(
+            port=port,
+            session_key=session_key,
+            conversations_dir=tmp_path / "conversations",
+        )
         client = TestClient(app)
         try:
             yield client, app
@@ -252,7 +261,7 @@ def test_subpath_returns_404_when_no_container(docker_app):
     assert resp.status_code == 404
 
 
-def test_delete_proxies_then_stops_container(docker_app):
+def test_delete_proxies_then_stops_container_and_removes_host_state(docker_app):
     client, app = docker_app
     create = client.post(
         "/api/conversations",
@@ -260,11 +269,16 @@ def test_delete_proxies_then_stops_container(docker_app):
     )
     cid = UUID(create.json()["echoed"]["conversation_id"])
     assert app.state.docker_registry.get(cid) is not None
+    conversation_dir = app.state.docker_registry.conversation_dir(cid)
+    conversation_dir.mkdir(parents=True)
+    (conversation_dir / "meta.json").write_text("{}")
+    conversation_dir.chmod(0o200)
 
     delete = client.delete(f"/api/conversations/{cid}")
     assert delete.status_code == 200
     assert delete.json() == {"deleted": str(cid)}
     assert app.state.docker_registry.get(cid) is None
+    assert not conversation_dir.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +419,11 @@ def docker_app_with_auth(tmp_path):
                 conversations_path=tmp_path / "conversations",
             )
         )
-        app.state.docker_registry = _StubRegistry(port=port, session_key=session_key)
+        app.state.docker_registry = _StubRegistry(
+            port=port,
+            session_key=session_key,
+            conversations_dir=tmp_path / "conversations",
+        )
         client = TestClient(app)
         try:
             yield client, app, outer_key
