@@ -135,6 +135,10 @@ async def docker_start_conversation(
             detail=f"Invalid conversation_id: {raw_cid!r}",
         ) from exc
     body["conversation_id"] = str(conversation_id)
+    body["workspace"] = {
+        "kind": "LocalWorkspace",
+        "working_dir": "/workspace",
+    }
 
     try:
         workspace, is_new = await registry.get_or_create(conversation_id)
@@ -232,6 +236,11 @@ async def docker_delete_conversation(
             safe_rmtree,
             registry.conversation_dir(conversation_id),
             f"conversation directory for {conversation_id}",
+        )
+        await asyncio.to_thread(
+            safe_rmtree,
+            registry.workspace_dir(conversation_id),
+            f"workspace directory for {conversation_id}",
         )
 
     return Response(

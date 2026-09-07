@@ -138,6 +138,32 @@ async def test_failed_start_can_be_retried(tmp_path):
     assert is_new is True
 
 
+def test_build_container_mounts_dedicated_writable_workspace(tmp_path, monkeypatch):
+    conversations_path = tmp_path / "conversations"
+    workspace_path = tmp_path / "workspaces"
+    registry = DockerConversationRegistry(
+        Config(
+            conversations_path=conversations_path,
+            workspace_path=workspace_path,
+        )
+    )
+    captured_volumes: list[str] = []
+
+    def run_container(**kwargs) -> RunningConversationContainer:
+        captured_volumes.extend(kwargs["volumes"])
+        return _container(kwargs["conversation_id"])
+
+    monkeypatch.setattr(registry, "_run_container", run_container)
+    monkeypatch.setattr(registry, "_wait_for_health", lambda *args, **kwargs: None)
+
+    conversation_id = uuid4()
+    registry._build_container(conversation_id)
+
+    host_workspace = workspace_path.resolve() / conversation_id.hex
+    assert host_workspace.is_dir()
+    assert f"{host_workspace}:/workspace" in captured_volumes
+
+
 def test_run_container_uses_host_identity_for_bind_mounts(tmp_path, monkeypatch):
     registry = DockerConversationRegistry(Config(conversations_path=tmp_path))
     commands: list[list[str]] = []

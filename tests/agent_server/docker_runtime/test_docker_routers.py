@@ -174,6 +174,9 @@ class _StubRegistry:
     def conversation_dir(self, cid: UUID) -> Path:
         return self.conversations_dir / cid.hex
 
+    def workspace_dir(self, cid: UUID) -> Path:
+        return self.conversations_dir.parent / "project" / cid.hex
+
     async def get_or_create(self, cid: UUID) -> tuple[_FakeWorkspace, bool]:
         if cid not in self._workspaces:
             self._workspaces[cid] = self._make()
@@ -234,6 +237,10 @@ def test_post_conversations_spawns_and_forwards(docker_app):
 
     inner_payload = payload["echoed"]
     cid = UUID(inner_payload["conversation_id"])
+    assert inner_payload["workspace"] == {
+        "kind": "LocalWorkspace",
+        "working_dir": "/workspace",
+    }
     assert app.state.docker_registry.get(cid) is not None
 
 
@@ -273,12 +280,16 @@ def test_delete_proxies_then_stops_container_and_removes_host_state(docker_app):
     conversation_dir.mkdir(parents=True)
     (conversation_dir / "meta.json").write_text("{}")
     conversation_dir.chmod(0o200)
+    workspace_dir = app.state.docker_registry.workspace_dir(cid)
+    workspace_dir.mkdir(parents=True)
+    (workspace_dir / "marker.txt").write_text("nested")
 
     delete = client.delete(f"/api/conversations/{cid}")
     assert delete.status_code == 200
     assert delete.json() == {"deleted": str(cid)}
     assert app.state.docker_registry.get(cid) is None
     assert not conversation_dir.exists()
+    assert not workspace_dir.exists()
 
 
 # ---------------------------------------------------------------------------

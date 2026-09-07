@@ -35,6 +35,7 @@ logger = get_logger(__name__)
 # via ``OH_CONVERSATIONS_PATH`` / ``OH_PERSISTENCE_DIR`` to use these.
 _CONTAINER_CONV_DIR = "/var/openhands/conversations"
 _CONTAINER_PERSIST_DIR = "/var/openhands/.openhands"
+_CONTAINER_WORKSPACE_DIR = "/workspace"
 _RUNTIME_OWNER_LABEL = "ai.openhands.runtime-owner"
 _CONVERSATION_ID_LABEL = "ai.openhands.conversation-id"
 
@@ -127,6 +128,9 @@ class DockerConversationRegistry:
 
     def conversation_dir(self, conversation_id: UUID) -> Path:
         return host_conv_subdir(self._config, conversation_id)
+
+    def workspace_dir(self, conversation_id: UUID) -> Path:
+        return self._config.workspace_path.resolve() / conversation_id.hex
 
     async def get_or_create(
         self, conversation_id: UUID
@@ -235,10 +239,13 @@ class DockerConversationRegistry:
         host_cid_dir = host_conv_dir / conversation_id.hex
         host_cid_dir.mkdir(parents=True, exist_ok=True)
         container_cid_dir = f"{_CONTAINER_CONV_DIR}/{conversation_id.hex}"
+        host_workspace_dir = self.workspace_dir(conversation_id)
+        host_workspace_dir.mkdir(parents=True, exist_ok=True)
 
         volumes = list(cfg.conversation_container_volumes) + [
             f"{host_cid_dir}:{container_cid_dir}",
             f"{host_persist_dir}:{_CONTAINER_PERSIST_DIR}",
+            f"{host_workspace_dir}:{_CONTAINER_WORKSPACE_DIR}",
         ]
         env = self._container_env()
 
