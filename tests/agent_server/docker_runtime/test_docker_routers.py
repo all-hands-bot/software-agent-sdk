@@ -63,6 +63,10 @@ def _build_inner_app(session_key: str) -> FastAPI:
             return {"detail": "unauthorized"}, 401
         return {"deleted": cid}
 
+    @api.get("/conversations/{cid}/events/search")
+    async def search_events(cid: str):
+        return {"items": [{"id": "inner-event", "conversation_id": cid}]}
+
     @api.get("/conversations/{cid}/run")
     async def get_run(cid: str, x_session_api_key: str = Header(default="")):
         if not _check(x_session_api_key):
@@ -612,3 +616,12 @@ def test_customization_without_conversation(docker_app):
     assert client.get("/api/canvas-extensions/installed").status_code == 200
     assert client.post("/api/hooks", json={}).status_code == 200
     assert not app.state.docker_registry._workspaces
+
+
+def test_event_search_is_served_by_container(docker_app):
+    client, app = docker_app
+    cid = uuid4()
+    app.state.docker_registry.preregister(cid)
+    response = client.get(f"/api/conversations/{cid}/events/search")
+    assert response.status_code == 200
+    assert response.json()["items"][0]["id"] == "inner-event"

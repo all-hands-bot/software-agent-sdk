@@ -4,6 +4,7 @@
 
 export interface HttpClientOptions {
   baseUrl: string;
+  conversationId?: string;
   apiKey?: string;
   timeout?: number;
 }
@@ -48,6 +49,7 @@ export class HttpError extends Error {
 }
 
 export class HttpClient {
+  private conversationId?: string;
   private baseUrl: string;
   private apiKey?: string;
   private timeout: number;
@@ -55,6 +57,7 @@ export class HttpClient {
   constructor(options: HttpClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '');
     this.apiKey = options.apiKey;
+    this.conversationId = options.conversationId;
     this.timeout = options.timeout || 60000;
   }
 
@@ -74,6 +77,9 @@ export class HttpClient {
       });
     }
 
+    if (this.conversationId && !url.searchParams.has('cid')) {
+      url.searchParams.set('cid', this.conversationId);
+    }
     return url;
   }
 

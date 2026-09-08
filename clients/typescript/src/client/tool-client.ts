@@ -2,6 +2,7 @@ import { HttpClient } from './http-client';
 
 export interface ToolClientOptions {
   host: string;
+  conversationId?: string;
   apiKey?: string;
   timeout?: number;
 }
@@ -16,6 +17,7 @@ export class ToolClient {
     this.apiKey = options.apiKey;
     this.client = new HttpClient({
       baseUrl: this.host,
+      conversationId: options.conversationId,
       apiKey: this.apiKey,
       timeout: options.timeout || 60000,
     });

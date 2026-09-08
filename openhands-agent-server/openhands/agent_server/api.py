@@ -431,13 +431,13 @@ def _add_api_routes(app: FastAPI) -> None:
     ]
 
     api_router = APIRouter(prefix="/api", dependencies=dependencies)
-    api_router.include_router(event_router)
     api_router.include_router(file_discovery_router)
     if config.conversation_runtime == "docker":
         api_router.include_router(docker_global_proxy_router)
         api_router.include_router(docker_conversation_proxy_router)
         api_router.include_router(conversation_router)
     else:
+        api_router.include_router(event_router)
         api_router.include_router(conversation_router)
         api_router.include_router(credential_binding_router)
         api_router.include_router(tool_router)
