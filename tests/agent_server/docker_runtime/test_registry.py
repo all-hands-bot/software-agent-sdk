@@ -177,6 +177,9 @@ def test_run_container_uses_host_identity_for_bind_mounts(tmp_path, monkeypatch)
         "openhands.agent_server.docker_runtime.registry.execute_command", execute
     )
     monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.subprocess.run", execute
+    )
+    monkeypatch.setattr(
         "openhands.agent_server.docker_runtime.registry.find_available_tcp_port",
         lambda: 32123,
     )
@@ -215,6 +218,9 @@ def test_run_container_applies_ownership_and_security_policy(tmp_path, monkeypat
 
     monkeypatch.setattr(
         "openhands.agent_server.docker_runtime.registry.execute_command", execute
+    )
+    monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.subprocess.run", execute
     )
     monkeypatch.setattr(
         "openhands.agent_server.docker_runtime.registry.find_available_tcp_port",
@@ -266,6 +272,9 @@ def test_cleanup_stale_containers_is_scoped_to_registry_owner(tmp_path, monkeypa
     monkeypatch.setattr(
         "openhands.agent_server.docker_runtime.registry.execute_command", execute
     )
+    monkeypatch.setattr(
+        "openhands.agent_server.docker_runtime.registry.subprocess.run", execute
+    )
 
     registry.cleanup_stale_containers()
 
@@ -291,3 +300,30 @@ def test_container_env_forces_inner_runtime_to_local(tmp_path, monkeypatch):
     env = registry._container_env()
 
     assert env["OH_CONVERSATION_RUNTIME"] == "local"
+
+
+def test_docker_launch_preserves_explicit_credentials(tmp_path, monkeypatch):
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "if sys.argv[1] == 'run':\n"
+        "    assert os.environ.get('OH_SECRET_KEY') == 'test-cipher'\n"
+        "    assert os.environ.get('OH_SESSION_API_KEYS_0') == 'test-session'\n"
+        "    assert 'OH_SESSION_API_KEYS_1' not in os.environ\n"
+        "    print('test-container')\n"
+    )
+    docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("OH_SESSION_API_KEYS_1", "not-forwarded")
+    registry = DockerConversationRegistry(Config(conversations_path=tmp_path))
+    container = registry._run_container(
+        conversation_id=uuid4(),
+        image="test-image",
+        platform="linux/amd64",
+        volumes=[],
+        env={"OH_SECRET_KEY": "test-cipher", "OH_SESSION_API_KEYS_0": "test-session"},
+        network=None,
+        api_key="test-session",
+    )
+    assert container.container_id == "test-container"

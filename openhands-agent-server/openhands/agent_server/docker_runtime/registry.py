@@ -15,6 +15,7 @@ import hashlib
 import os
 import random
 import socket
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +25,7 @@ from uuid import UUID, uuid4
 from openhands.agent_server.config import V1_SESSION_API_KEY_ENV, Config
 from openhands.agent_server.persistence.store import _get_persistence_dir
 from openhands.sdk.logger import get_logger
-from openhands.sdk.utils.command import execute_command
+from openhands.sdk.utils.command import execute_command, sanitized_env
 
 
 logger = get_logger(__name__)
@@ -316,7 +317,7 @@ class DockerConversationRegistry:
                 "Docker is not available. Please install and start Docker."
             )
 
-        docker_env = dict(os.environ)
+        docker_env = sanitized_env()
         flags: list[str] = []
         for key, value in env.items():
             docker_env[key] = value
@@ -367,7 +368,11 @@ class DockerConversationRegistry:
             "--port",
             "8000",
         ]
-        proc = execute_command(run_cmd, env=docker_env)
+        # This trusted launcher must pass the explicitly forwarded server credentials;
+        # execute_command strips them to protect agent-controlled subprocesses.
+        proc = subprocess.run(
+            run_cmd, env=docker_env, capture_output=True, text=True, check=False
+        )
         if proc.returncode != 0:
             raise RuntimeError(f"Failed to run docker container: {proc.stderr}")
 
