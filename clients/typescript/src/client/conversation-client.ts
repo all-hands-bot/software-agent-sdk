@@ -67,8 +67,21 @@ export class ConversationClient {
   async createConversation<TConversation = ConversationInfo>(
     payload: CreateConversationPayload
   ): Promise<TConversation> {
-    const response = await this.client.post<TConversation>('/api/conversations', payload);
-    return response.data;
+    try {
+      const response = await this.client.post<TConversation>('/api/conversations', payload);
+      return response.data;
+    } catch (error) {
+      // A lost response does not mean the initial message was not executed.
+      // Reconcile by the caller's stable id; never replay the POST.
+      if (!(error instanceof HttpError) && typeof payload.conversation_id === 'string') {
+        try {
+          return await this.getConversation<TConversation>(payload.conversation_id);
+        } catch {
+          // Preserve the original failure if creation cannot be confirmed.
+        }
+      }
+      throw error;
+    }
   }
 
   async searchConversations(

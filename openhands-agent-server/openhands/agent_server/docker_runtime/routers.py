@@ -72,15 +72,29 @@ def _ws_get_registry(websocket: WebSocket) -> DockerConversationRegistry | None:
     return getattr(websocket.app.state, "docker_registry", None)
 
 
-def _workspace_or_404(
+async def _workspace_or_404(
     registry: DockerConversationRegistry, conversation_id: UUID
 ) -> RunningConversationContainer:
     ws = registry.get(conversation_id)
-    if ws is None:
+    if ws is not None:
+        return ws
+    directory = registry.conversation_dir(conversation_id)
+    if (
+        not (directory / "meta.json").is_file()
+        or not (directory / "base_state.json").is_file()
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation not found: {conversation_id}",
         )
+    try:
+        ws, _ = await registry.get_or_create(conversation_id)
+    except Exception as exc:
+        logger.exception("Could not recover conversation %s", conversation_id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not recover conversation container",
+        ) from exc
     return ws
 
 
@@ -203,12 +217,7 @@ async def docker_delete_conversation(
     request: Request,
 ) -> Response:
     registry = get_registry(request)
-    workspace = registry.get(conversation_id)
-    if workspace is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Conversation not found: {conversation_id}",
-        )
+    workspace = await _workspace_or_404(registry, conversation_id)
 
     # Best-effort: ask the inner server to delete its own state first, then
     # always tear the container down so we don't leak it even if the inner
@@ -264,7 +273,7 @@ async def docker_proxy_conversation_root_mutation(
     persistence dir.
     """
     registry = get_registry(request)
-    workspace = _workspace_or_404(registry, conversation_id)
+    workspace = await _workspace_or_404(registry, conversation_id)
     return await proxy_http(
         request,
         workspace,
@@ -290,7 +299,7 @@ async def docker_proxy_conversation_subpath(
     server).
     """
     registry = get_registry(request)
-    workspace = _workspace_or_404(registry, conversation_id)
+    workspace = await _workspace_or_404(registry, conversation_id)
     upstream_path = _build_upstream_path(
         request, f"/api/conversations/{conversation_id}/{tail}"
     )
@@ -323,7 +332,7 @@ async def docker_proxy_workspace_file(
     request through to its identical route.
     """
     registry = get_registry(request)
-    workspace = _workspace_or_404(registry, conversation_id)
+    workspace = await _workspace_or_404(registry, conversation_id)
     upstream_path = _build_upstream_path(
         request,
         f"/api/conversations/{conversation_id}/workspace/{file_path}",
@@ -364,10 +373,10 @@ async def docker_events_websocket(
     if registry is None:
         await websocket.close(code=1011)
         return
-    workspace = registry.get(conversation_id)
-    if workspace is None:
-        # 1008 == policy violation; closest standard code for "no such conv".
-        await websocket.close(code=1008)
+    try:
+        workspace = await _workspace_or_404(registry, conversation_id)
+    except HTTPException as exc:
+        await websocket.close(code=1008 if exc.status_code == 404 else 1011)
         return
 
     # Strip the auth query param before forwarding upstream — the outer's
@@ -452,7 +461,7 @@ def _make_docker_global_handler(prefix: str):
                 ),
             )
         registry = get_registry(request)
-        workspace = _workspace_or_404(registry, cid)
+        workspace = await _workspace_or_404(registry, cid)
         upstream_path = _build_upstream_path(
             request, f"/api/{prefix}/{tail}" if tail else f"/api/{prefix}"
         )

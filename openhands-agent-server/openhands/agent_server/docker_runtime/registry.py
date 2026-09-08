@@ -75,10 +75,9 @@ class RunningConversationContainer:
 class DockerConversationRegistry:
     """Hand out one Docker container per conversation id.
 
-    The registry is in-memory: restarting the outer agent-server forgets
-    every running container. That's deliberate for this first docker-runtime
-    mode; the persisted conversation state remains on disk, while container
-    re-attachment/reclaiming can be added later.
+    Connections are in-memory. After an outer-server restart, routes lazily
+    recreate containers for persisted conversations using the same state and
+    workspace mounts. The inner server restores its conversation on access.
     """
 
     def __init__(self, config: Config) -> None:

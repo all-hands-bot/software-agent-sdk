@@ -625,3 +625,44 @@ def test_event_search_is_served_by_container(docker_app):
     response = client.get(f"/api/conversations/{cid}/events/search")
     assert response.status_code == 200
     assert response.json()["items"][0]["id"] == "inner-event"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/conversations/{cid}/events/search",
+        "/api/bash/sessions?cid={cid}",
+        "/api/conversations/{cid}/workspace/index.html",
+    ],
+)
+def test_persisted_conversation_recovers_after_registry_restart(docker_app, path):
+    client, app = docker_app
+    registry = app.state.docker_registry
+    cid = uuid4()
+    directory = registry.conversation_dir(cid)
+    directory.mkdir(parents=True)
+    (directory / "meta.json").write_text("{}")
+    (directory / "base_state.json").write_text("{}")
+    assert registry.get(cid) is None
+    response = client.get(path.format(cid=cid))
+    assert response.status_code == 200
+    assert registry.get(cid) is not None
+
+
+def test_persisted_conversation_websocket_recovers_after_restart(docker_app):
+    client, app = docker_app
+    registry = app.state.docker_registry
+    cid = uuid4()
+    directory = registry.conversation_dir(cid)
+    directory.mkdir(parents=True)
+    (directory / "meta.json").write_text("{}")
+    (directory / "base_state.json").write_text("{}")
+    with client.websocket_connect(f"/sockets/events/{cid}") as ws:
+        assert ws.receive_text() == f"hello {cid}"
+
+
+def test_unknown_conversation_does_not_start_container(docker_app):
+    client, app = docker_app
+    cid = uuid4()
+    assert client.get(f"/api/conversations/{cid}/events/search").status_code == 404
+    assert app.state.docker_registry.get(cid) is None
