@@ -567,3 +567,48 @@ def test_workspace_router_registered_under_cookie_auth_in_docker_mode(tmp_path):
         if getattr(route, "path", None) == catchall_path
     )
     assert workspace_route_index < catchall_route_index
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/llm/models/verified",
+        "/api/llm/providers",
+        "/api/llm/provider-connections",
+        "/api/llm/subscription/openai/models",
+    ],
+)
+def test_llm_discovery_without_conversation(docker_app, path):
+    client, app = docker_app
+    response = client.get(path)
+    assert response.status_code == 200
+    assert isinstance(response.json(), (dict, list))
+    assert not app.state.docker_registry._workspaces
+
+
+def test_workspace_discovery_without_conversation(docker_app, tmp_path):
+    client, app = docker_app
+    response = client.get("/api/file/home")
+    assert response.status_code == 200
+    assert response.json()["home"] == str(Path.home())
+    response = client.get("/api/file/search_subdirs", params={"path": str(tmp_path)})
+    assert response.status_code == 200
+    assert not app.state.docker_registry._workspaces
+
+
+def test_customization_without_conversation(docker_app):
+    client, app = docker_app
+    response = client.post(
+        "/api/skills",
+        json={
+            "load_public": False,
+            "load_user": False,
+            "load_project": False,
+            "load_org": False,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["skills"] == []
+    assert client.get("/api/canvas-extensions/installed").status_code == 200
+    assert client.post("/api/hooks", json={}).status_code == 200
+    assert not app.state.docker_registry._workspaces

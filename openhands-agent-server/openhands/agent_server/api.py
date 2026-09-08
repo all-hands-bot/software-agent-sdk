@@ -47,7 +47,7 @@ from openhands.agent_server.docker_runtime.routers import (
     docker_workspace_proxy_router,
 )
 from openhands.agent_server.event_router import event_router
-from openhands.agent_server.file_router import file_router
+from openhands.agent_server.file_router import file_discovery_router, file_router
 from openhands.agent_server.git_router import git_router
 from openhands.agent_server.hooks_router import hooks_router
 from openhands.agent_server.init_router import (
@@ -432,6 +432,7 @@ def _add_api_routes(app: FastAPI) -> None:
 
     api_router = APIRouter(prefix="/api", dependencies=dependencies)
     api_router.include_router(event_router)
+    api_router.include_router(file_discovery_router)
     if config.conversation_runtime == "docker":
         api_router.include_router(docker_global_proxy_router)
         api_router.include_router(docker_conversation_proxy_router)
@@ -445,14 +446,14 @@ def _add_api_routes(app: FastAPI) -> None:
         api_router.include_router(file_router)
         api_router.include_router(vscode_router)
         api_router.include_router(desktop_router)
-        api_router.include_router(skills_router)
-        api_router.include_router(sub_agents_router)
-        api_router.include_router(plugins_router)
-        api_router.include_router(canvas_extensions_router)
-        api_router.include_router(hooks_router)
-        api_router.include_router(llm_router)
-        api_router.include_router(provider_connections_router)
         api_router.include_router(mcp_router)
+    api_router.include_router(skills_router)
+    api_router.include_router(sub_agents_router)
+    api_router.include_router(plugins_router)
+    api_router.include_router(canvas_extensions_router)
+    api_router.include_router(hooks_router)
+    api_router.include_router(llm_router)
+    api_router.include_router(provider_connections_router)
     api_router.include_router(settings_router)
     api_router.include_router(workspaces_router)
     api_router.include_router(profiles_router)

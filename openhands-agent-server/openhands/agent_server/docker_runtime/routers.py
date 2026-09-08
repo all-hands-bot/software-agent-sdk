@@ -15,7 +15,7 @@ What this module provides (the *new* surface):
   the outer's session keys, then bridges to the inner container.
 * ``docker_global_proxy_router`` — reverse-proxies the *global*
   (non-conversation-scoped) routers (bash, file, git, vscode, desktop,
-  hooks, mcp, skills, tool, llm) to a chosen sub-container. Each request
+  mcp, tool) to a chosen sub-container. Each request
   must include a ``?cid=…`` query param identifying which conversation's
   container to talk to.
 
@@ -394,7 +394,7 @@ def _strip_auth_query(query: str) -> str:
 
 # ---------------------------------------------------------------------------
 # HTTP: global (non-cid-scoped) routes — bash, git, file, vscode, desktop,
-# hooks, mcp, skills, tool, llm. These live at fixed prefixes like ``/bash``,
+# mcp, tool. These live at fixed prefixes like ``/bash``,
 # ``/git``, ``/file``, etc. In docker mode they MUST carry a ``?cid=...``
 # query parameter so the outer knows which sub-container to talk to.
 # ---------------------------------------------------------------------------
@@ -410,11 +410,8 @@ _DOCKER_GLOBAL_PREFIXES: tuple[str, ...] = (
     "file",
     "vscode",
     "desktop",
-    "hooks",
     "mcp",
-    "skills",
     "tools",
-    "llm",
 )
 
 _GLOBAL_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
@@ -439,7 +436,7 @@ def _make_docker_global_handler(prefix: str):
                 description=(
                     "Conversation id whose container should serve the request. "
                     "Required for global routers (bash / git / file / vscode / "
-                    "desktop / hooks / mcp / skills / tools / llm) when "
+                    "desktop / mcp / tools) when "
                     "``conversation_runtime == 'docker'``."
                 ),
             ),
