@@ -56,6 +56,7 @@ class RunningConversationContainer:
     api_key: str | None
     container_id: str | None
     image: str
+    scoped_runtime_verified: bool = False
 
     def cleanup(self) -> None:
         if self.container_id is None:
@@ -156,7 +157,7 @@ class DockerConversationRegistry:
                 self._starts[conversation_id] = task
 
         try:
-            container = await task
+            container = await asyncio.shield(task)
         except Exception:
             async with self._lock:
                 if self._starts.get(conversation_id) is task:

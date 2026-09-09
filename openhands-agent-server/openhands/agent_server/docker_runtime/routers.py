@@ -140,6 +140,24 @@ async def docker_start_conversation(
             detail=f"Invalid JSON body: {exc}",
         ) from exc
 
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Expected a JSON object")
+    selected_workspace = body.get("workspace")
+    if selected_workspace is not None and (
+        not isinstance(selected_workspace, dict)
+        or selected_workspace.get("working_dir", "/workspace") != "/workspace"
+        or selected_workspace.get("kind", "LocalWorkspace") != "LocalWorkspace"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Docker conversations use a new isolated /workspace. Host project "
+                "paths cannot be mounted or copied through this API. Omit workspace "
+                "to explicitly create an isolated workspace, or use local runtime "
+                "to work on a host project."
+            ),
+        )
+
     raw_cid = body.get("conversation_id")
     try:
         conversation_id = UUID(raw_cid) if raw_cid else uuid4()
@@ -419,7 +437,6 @@ _DOCKER_GLOBAL_PREFIXES: tuple[str, ...] = (
     "file",
     "vscode",
     "desktop",
-    "tools",
 )
 
 _GLOBAL_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]

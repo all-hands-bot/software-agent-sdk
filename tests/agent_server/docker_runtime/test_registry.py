@@ -327,3 +327,76 @@ def test_docker_launch_preserves_explicit_credentials(tmp_path, monkeypatch):
         api_key="test-session",
     )
     assert container.container_id == "test-container"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_waiter_does_not_cancel_other_waiters(tmp_path):
+    registry = DockerConversationRegistry(Config(conversations_path=tmp_path))
+    cid = uuid4()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def build(conversation_id):
+        entered.set()
+        assert release.wait(timeout=5)
+        return _container(conversation_id)
+
+    registry._build_container = build
+    first = asyncio.create_task(registry.get_or_create(cid))
+    second = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        second = asyncio.create_task(registry.get_or_create(cid))
+        await asyncio.sleep(0)
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        release.set()
+        result = await asyncio.gather(second, return_exceptions=True)
+        assert not isinstance(result[0], BaseException), (
+            "A disconnected or timed-out caller cancelled another startup waiter"
+        )
+        assert registry.get(cid) is result[0][0]
+    finally:
+        release.set()
+        await asyncio.gather(
+            first, *([second] if second else []), return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [True, False])
+async def test_lone_cancelled_waiter_can_recover_or_shutdown(
+    tmp_path, recover, monkeypatch
+):
+    registry = DockerConversationRegistry(Config(conversations_path=tmp_path))
+    cid = uuid4()
+    entered = threading.Event()
+    release = threading.Event()
+    cleaned = []
+
+    def build(conversation_id):
+        entered.set()
+        assert release.wait(timeout=5)
+        return _container(conversation_id)
+
+    registry._build_container = build
+    monkeypatch.setattr(
+        RunningConversationContainer,
+        "cleanup",
+        lambda container: cleaned.append(container),
+    )
+    waiter = asyncio.create_task(registry.get_or_create(cid))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+        release.set()
+        if recover:
+            container, _ = await registry.get_or_create(cid)
+            assert registry.get(cid) is container
+        await registry.shutdown()
+        assert len(cleaned) == 1
+        assert registry.get(cid) is None
+    finally:
+        release.set()
+        await asyncio.gather(waiter, return_exceptions=True)

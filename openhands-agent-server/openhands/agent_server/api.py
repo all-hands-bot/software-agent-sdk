@@ -67,8 +67,9 @@ from openhands.agent_server.profiles_router import profiles_router
 from openhands.agent_server.provider_connections_router import (
     provider_connections_router,
 )
+from openhands.agent_server.runtime_router import create_runtime_router
 from openhands.agent_server.server_details_router import (
-    get_server_info,
+    get_runtime_server_info,
     mark_initialization_complete,
     server_details_router,
 )
@@ -432,6 +433,8 @@ def _add_api_routes(app: FastAPI) -> None:
 
     api_router = APIRouter(prefix="/api", dependencies=dependencies)
     api_router.include_router(file_discovery_router)
+    api_router.include_router(tool_router)
+    api_router.include_router(create_runtime_router())
     if config.conversation_runtime == "docker":
         api_router.include_router(docker_global_proxy_router)
         api_router.include_router(docker_conversation_proxy_router)
@@ -440,7 +443,6 @@ def _add_api_routes(app: FastAPI) -> None:
         api_router.include_router(event_router)
         api_router.include_router(conversation_router)
         api_router.include_router(credential_binding_router)
-        api_router.include_router(tool_router)
         api_router.include_router(bash_router)
         api_router.include_router(git_router)
         api_router.include_router(file_router)
@@ -502,7 +504,7 @@ def _setup_static_files(app: FastAPI, config: Config) -> None:
         and config.static_files_path.is_dir()
     ):
         # Map the root path to server info if there are no static files
-        app.get("/", tags=["Server Details"])(get_server_info)
+        app.get("/", tags=["Server Details"])(get_runtime_server_info)
         return
 
     # Mount static files directory

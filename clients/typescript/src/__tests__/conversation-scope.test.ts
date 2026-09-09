@@ -7,9 +7,15 @@ describe('conversation-scoped requests', () => {
   let server: Server;
   let host: string;
   const urls: string[] = [];
+  let scoped = false;
   beforeAll(async () => {
     server = createServer((req, res) => {
       urls.push(req.url!);
+      if (req.url === '/server_info') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ capabilities: scoped ? ['conversation_runtime_routes_v1'] : [] }));
+        return;
+      }
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ exit_code: 0, stdout: 'ok', stderr: '' }));
     });
@@ -29,6 +35,26 @@ describe('conversation-scoped requests', () => {
     const result = await workspace.executeCommand('pwd');
     expect(result.stdout).toBe('ok');
     expect(urls.pop()).toBe('/api/bash/execute_bash_command?cid=demo-cid');
+  });
+  it('uses canonical routes and preserves explicit context on capable servers', async () => {
+    scoped = true;
+    try {
+      const client = new HttpClient({ baseUrl: host, conversationId: 'default' });
+      await client.get('/api/file/download', { params: { cid: 'explicit', path: '/workspace/a' } });
+      expect(urls.pop()).toBe('/api/conversations/explicit/file/download?path=%2Fworkspace%2Fa');
+      await client.post('/api/bash/execute_bash_command', { command: 'pwd' });
+      expect(urls.pop()).toBe('/api/conversations/default/bash/execute_bash_command');
+      await client.get('/api/tools/');
+      expect(urls.pop()).toBe('/api/tools/');
+      await client.get('/api/file/home');
+      expect(urls.pop()).toBe('/api/file/home');
+      await client.post('/api/mcp/test', { server: {} });
+      expect(urls.pop()).toBe('/api/conversations/default/mcp/test');
+      await client.get('/api/mcp/oauth/status/job');
+      expect(urls.pop()).toBe('/api/mcp/oauth/status/job');
+    } finally {
+      scoped = false;
+    }
   });
   it('preserves unscoped behavior and explicit query context', async () => {
     await new HttpClient({ baseUrl: host }).get('/api/file/home');

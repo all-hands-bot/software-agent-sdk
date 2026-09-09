@@ -9,6 +9,8 @@ layer would show up here.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -37,6 +39,10 @@ def _build_inner_app(session_key: str) -> FastAPI:
 
     def _check(authorization: str | None) -> bool:
         return authorization == session_key
+
+    @app.get("/server_info")
+    async def server_info():
+        return {"capabilities": []}
 
     api = APIRouter(prefix="/api")
 
@@ -149,6 +155,7 @@ class _FakeWorkspace:
 
     host: str
     api_key: str | None
+    scoped_runtime_verified: bool = False
 
 
 @dataclass
@@ -233,7 +240,7 @@ def docker_app(tmp_path):
 def test_post_conversations_spawns_and_forwards(docker_app):
     client, app = docker_app
     body = {
-        "workspace": {"working_dir": "/host/will-be-rewritten"},
+        "workspace": {"working_dir": "/workspace"},
         "agent": {"kind": "Agent"},
     }
     resp = client.post("/api/conversations", json=body)
@@ -253,7 +260,7 @@ def test_subpath_proxied_to_inner_server(docker_app):
     client, _ = docker_app
     create = client.post(
         "/api/conversations",
-        json={"workspace": {"working_dir": "/x"}, "agent": {}},
+        json={"workspace": {"working_dir": "/workspace"}, "agent": {}},
     )
     cid = UUID(create.json()["echoed"]["conversation_id"])
 
@@ -277,7 +284,7 @@ def test_delete_proxies_then_stops_container_and_removes_host_state(docker_app):
     client, app = docker_app
     create = client.post(
         "/api/conversations",
-        json={"workspace": {"working_dir": "/x"}, "agent": {}},
+        json={"workspace": {"working_dir": "/workspace"}, "agent": {}},
     )
     cid = UUID(create.json()["echoed"]["conversation_id"])
     assert app.state.docker_registry.get(cid) is not None
@@ -717,3 +724,103 @@ def test_mcp_setup_routes_without_conversation(
     response = client.request(method, path, json=payload)
     assert response.status_code == expected_status, response.text
     assert not app.state.docker_registry._workspaces
+
+
+def test_tool_catalog_is_available_before_conversation(docker_app):
+    client, app = docker_app
+    response = client.get("/api/tools/")
+    assert response.status_code == 200, response.text
+    assert isinstance(response.json(), list)
+    assert response.json()
+    assert not app.state.docker_registry._workspaces
+
+
+def test_selected_project_is_not_silently_replaced(docker_app, tmp_path):
+    client, app = docker_app
+    project = tmp_path / "selected-project"
+    project.mkdir()
+    (project / "project.txt").write_text("selected project contents")
+    response = client.post(
+        "/api/conversations",
+        json={"workspace": {"working_dir": str(project)}, "agent": {}},
+    )
+    # Unsupported host workspaces must be rejected, not accepted as empty ones.
+    if 400 <= response.status_code < 500:
+        assert not app.state.docker_registry._workspaces
+        return
+    assert response.status_code == 200, response.text
+    cid = UUID(response.json()["echoed"]["conversation_id"])
+    selected_file = app.state.docker_registry.workspace_dir(cid) / "project.txt"
+    assert selected_file.is_file(), "Creation silently discarded the selected project"
+    assert selected_file.read_text() == "selected project contents"
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_DOCKER_BOUNDARY_TESTS") != "1",
+    reason="Requires an existing local agent-server Docker image",
+)
+def test_host_mcp_probe_does_not_claim_container_verification(docker_app, tmp_path):
+    client, _ = docker_app
+    executable = tmp_path / "host-only-mcp"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "from fastmcp import FastMCP\n"
+        "m = FastMCP('host-only')\n"
+        "@m.tool()\n"
+        "def echo(message: str) -> str: return message\n"
+        "m.run()\n"
+    )
+    executable.chmod(0o700)
+    response = client.post(
+        "/api/mcp/test",
+        json={"server": {"transport": "stdio", "command": str(executable)}},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+    assert response.json()["scope"] == "host"
+    assert response.json()["runtime_verified"] is False
+    # Only the Docker boundary is external: the probe and executable are real.
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network=none",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--entrypoint",
+            "/bin/sh",
+            "ghcr.io/openhands/agent-server:latest-python",
+            "-c",
+            'test -x "$1"',
+            "sh",
+            str(executable),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 1, result.stderr
+
+
+def test_scoped_runtime_requires_capable_inner_image(docker_app):
+    client, app = docker_app
+    cid = uuid4()
+    app.state.docker_registry.preregister(cid)
+    response = client.get(f"/api/conversations/{cid}/vscode/status")
+    assert response.status_code == 409
+    assert "image" in response.json()["detail"]
+    legacy = client.get(f"/api/bash/sessions?cid={cid}")
+    assert legacy.status_code == 200
+
+
+def test_scoped_runtime_auth_and_unknown_conversation(docker_app):
+    client, app = docker_app
+    response = client.get(f"/api/conversations/{uuid4()}/vscode/status")
+    assert response.status_code == 404
+    app.state.config = app.state.config.model_copy(
+        update={"session_api_keys": ["secret"]}
+    )
+    response = client.get(f"/api/conversations/{uuid4()}/vscode/status")
+    assert response.status_code == 401
