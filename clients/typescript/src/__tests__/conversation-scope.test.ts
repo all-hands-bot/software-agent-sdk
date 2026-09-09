@@ -1,5 +1,6 @@
 import { createServer, Server } from 'node:http';
 import { AddressInfo } from 'node:net';
+import { ServerClient } from '../client/server-client';
 import { HttpClient } from '../client/http-client';
 import { RemoteWorkspace } from '../workspace/remote-workspace';
 
@@ -25,6 +26,9 @@ describe('conversation-scoped requests', () => {
   afterAll(async () => {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  it('advertises client-side runtime routing support', () => {
+    expect(ServerClient.supportsConversationRuntimeRoutes).toBe(true);
   });
   it('scopes workspace commands to their conversation', async () => {
     const workspace = new RemoteWorkspace({
