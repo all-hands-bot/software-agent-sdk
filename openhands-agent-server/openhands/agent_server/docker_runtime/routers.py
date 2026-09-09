@@ -403,7 +403,7 @@ def _strip_auth_query(query: str) -> str:
 
 # ---------------------------------------------------------------------------
 # HTTP: global (non-cid-scoped) routes — bash, git, file, vscode, desktop,
-# mcp, tool. These live at fixed prefixes like ``/bash``,
+# tool. These live at fixed prefixes like ``/bash``,
 # ``/git``, ``/file``, etc. In docker mode they MUST carry a ``?cid=...``
 # query parameter so the outer knows which sub-container to talk to.
 # ---------------------------------------------------------------------------
@@ -419,7 +419,6 @@ _DOCKER_GLOBAL_PREFIXES: tuple[str, ...] = (
     "file",
     "vscode",
     "desktop",
-    "mcp",
     "tools",
 )
 
@@ -445,7 +444,7 @@ def _make_docker_global_handler(prefix: str):
                 description=(
                     "Conversation id whose container should serve the request. "
                     "Required for global routers (bash / git / file / vscode / "
-                    "desktop / mcp / tools) when "
+                    "desktop / tools) when "
                     "``conversation_runtime == 'docker'``."
                 ),
             ),

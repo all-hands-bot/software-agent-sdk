@@ -9,6 +9,7 @@ layer would show up here.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -666,3 +667,53 @@ def test_unknown_conversation_does_not_start_container(docker_app):
     cid = uuid4()
     assert client.get(f"/api/conversations/{cid}/events/search").status_code == 404
     assert app.state.docker_registry.get(cid) is None
+
+
+def test_mcp_probe_without_conversation(docker_app):
+    client, app = docker_app
+    script = (
+        "from fastmcp import FastMCP\n"
+        "mcp = FastMCP('docker-setup-test')\n"
+        "@mcp.tool()\n"
+        "def echo(message: str) -> str:\n"
+        "    return message\n"
+        "mcp.run()\n"
+    )
+    response = client.post(
+        "/api/mcp/test",
+        json={
+            "server": {
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": ["-c", script],
+            },
+            "timeout": 15,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+    assert response.json()["tools"] == ["echo"]
+    assert not app.state.docker_registry._workspaces
+
+
+@pytest.mark.parametrize(
+    "method,path,payload,expected_status",
+    [
+        ("post", "/api/mcp/test", {}, 422),
+        ("post", "/api/mcp/oauth/start", {}, 422),
+        ("get", "/api/mcp/oauth/status/unknown", None, 404),
+        (
+            "post",
+            "/api/mcp/oauth/callback/unknown",
+            {"callback_url": "http://127.0.0.1/callback?code=test"},
+            404,
+        ),
+    ],
+)
+def test_mcp_setup_routes_without_conversation(
+    docker_app, method, path, payload, expected_status
+):
+    client, app = docker_app
+    response = client.request(method, path, json=payload)
+    assert response.status_code == expected_status, response.text
+    assert not app.state.docker_registry._workspaces

@@ -446,7 +446,7 @@ def _add_api_routes(app: FastAPI) -> None:
         api_router.include_router(file_router)
         api_router.include_router(vscode_router)
         api_router.include_router(desktop_router)
-        api_router.include_router(mcp_router)
+    api_router.include_router(mcp_router)
     api_router.include_router(skills_router)
     api_router.include_router(sub_agents_router)
     api_router.include_router(plugins_router)
