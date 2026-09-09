@@ -135,7 +135,32 @@ def create_runtime_router() -> APIRouter:
         git_router,
         desktop_router,
     ):
-        router.include_router(source)
+        for route in source.routes:
+            if isinstance(route, APIRoute):
+                router.add_api_route(
+                    route.path,
+                    route.endpoint,
+                    methods=list(route.methods),
+                    response_model=route.response_model,
+                    status_code=route.status_code,
+                    tags=route.tags,
+                    dependencies=route.dependencies,
+                    summary=route.summary,
+                    description=route.description,
+                    response_description=route.response_description,
+                    responses=route.responses,
+                    deprecated=route.deprecated,
+                    response_model_include=route.response_model_include,
+                    response_model_exclude=route.response_model_exclude,
+                    response_model_by_alias=route.response_model_by_alias,
+                    response_model_exclude_unset=route.response_model_exclude_unset,
+                    response_model_exclude_defaults=route.response_model_exclude_defaults,
+                    response_model_exclude_none=route.response_model_exclude_none,
+                    response_class=route.response_class,
+                    name=route.name,
+                    callbacks=route.callbacks,
+                    openapi_extra=route.openapi_extra,
+                )
     router.add_api_route("/vscode/url", get_runtime_vscode_url, methods=["GET"])
     for route in vscode_router.routes:
         if isinstance(route, APIRoute) and route.path != "/vscode/url":

@@ -13,6 +13,10 @@ from openhands.agent_server.api import create_app
 from openhands.agent_server.bash_service import BashEventService
 from openhands.agent_server.config import Config
 from openhands.agent_server.conversation_service import ConversationService
+from openhands.agent_server.runtime_router import (
+    ConversationRuntimeRoute,
+    create_runtime_router,
+)
 from openhands.agent_server.vscode_service import VSCodeService
 from tests.agent_server.docker_runtime.test_docker_routers import _StubRegistry
 
@@ -244,3 +248,9 @@ async def test_scoped_vscode_defaults_to_conversation_workspace(
     response = await client.get(f"/api/conversations/{cid}/vscode/url")
     assert response.status_code == 200, response.text
     assert response.json()["url"] == service.get_vscode_url(workspace_dir=str(root))
+
+
+def test_runtime_routes_are_registered_with_dispatch_adapter():
+    router = create_runtime_router()
+    assert router.routes
+    assert all(isinstance(route, ConversationRuntimeRoute) for route in router.routes)
